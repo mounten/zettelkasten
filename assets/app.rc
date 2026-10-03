@@ -1,0 +1,2 @@
+// Resource id 1 is what gpui loads as the window and taskbar icon.
+1 ICON "app.ico"
