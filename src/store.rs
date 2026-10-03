@@ -12,7 +12,7 @@ use std::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Card, CardColor, CardKind, TodoItem, fenced};
+use crate::model::{Card, CardColor, CardKind, SavedQuery, TodoItem, fenced};
 
 /// Hidden folder inside a vault for app state and the trash.
 const META_DIR: &str = ".zettelkasten";
@@ -28,6 +28,8 @@ pub struct AppConfig {
     pub last_vault: Option<PathBuf>,
     pub sidebar_width: f32,
     pub dock_width: f32,
+    /// Collapsed sidebar sections, by label.
+    pub collapsed_sections: Vec<String>,
 }
 
 impl Default for AppConfig {
@@ -37,6 +39,7 @@ impl Default for AppConfig {
             last_vault: None,
             sidebar_width: 232.,
             dock_width: 280.,
+            collapsed_sections: Vec::new(),
         }
     }
 }
@@ -109,6 +112,10 @@ pub fn retire_legacy_cards() -> io::Result<()> {
 pub struct VaultState {
     /// Ids of minimized cards, most recent first.
     pub minimized: Vec<String>,
+    /// Searches saved in the sidebar, in display order.
+    pub queries: Vec<SavedQuery>,
+    /// Projects whose components are shown in the sidebar.
+    pub expanded_projects: Vec<String>,
 }
 
 pub struct Vault {
@@ -282,6 +289,12 @@ struct FrontMatter {
     title: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    component: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    feature: Option<String>,
     #[serde(default)]
     color: CardColor,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -298,6 +311,9 @@ pub fn card_to_markdown(card: &Card) -> String {
         kind: card.kind,
         title: card.title.clone(),
         tags: card.tags.clone(),
+        project: card.project.clone(),
+        component: card.component.clone(),
+        feature: card.feature.clone(),
         color: card.color,
         pinned: card.pinned,
         language: card.language.clone(),
@@ -364,6 +380,11 @@ fn card_from_parts(front: FrontMatter, body: &str) -> Card {
         body,
         items,
         tags: front.tags,
+        // A component without a project, or a feature without a component,
+        // has nowhere to show up.
+        feature: front.feature.filter(|_| front.project.is_some() && front.component.is_some()),
+        component: front.component.filter(|_| front.project.is_some()),
+        project: front.project,
         color: front.color,
         pinned: front.pinned,
         language: front.language,
@@ -453,11 +474,17 @@ mod tests {
         card.title = "Idea: \"quotes\" and: colons".into();
         card.body = "# Heading\n\n---\n\nSome **bold** text".into();
         card.tags = vec!["a".into(), "b-c".into()];
+        card.project = Some("zettel".into());
+        card.component = Some("store".into());
+        card.feature = Some("front-matter".into());
         card.pinned = true;
         let back = round_trip(&card);
         assert_eq!(back.title, card.title);
         assert_eq!(back.body, card.body);
         assert_eq!(back.tags, card.tags);
+        assert_eq!(back.project, card.project);
+        assert_eq!(back.component, card.component);
+        assert_eq!(back.feature, card.feature);
         assert!(back.pinned);
     }
 

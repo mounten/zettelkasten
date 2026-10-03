@@ -87,6 +87,15 @@ pub struct Card {
     pub items: Vec<TodoItem>,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Project the card belongs to, e.g. `zettelkasten`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    /// Component within the project, e.g. `sidebar`; only set with a project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component: Option<String>,
+    /// Feature within the component, e.g. `saved-queries`; only set with a component.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feature: Option<String>,
     #[serde(default)]
     pub color: CardColor,
     #[serde(default)]
@@ -108,6 +117,9 @@ impl Card {
             body: String::new(),
             items: Vec::new(),
             tags: Vec::new(),
+            project: None,
+            component: None,
+            feature: None,
             color: match kind {
                 CardKind::Todo => CardColor::Yellow,
                 _ => CardColor::Slate,
@@ -218,16 +230,76 @@ impl Card {
         self.tags.iter().any(|t| t.eq_ignore_ascii_case(tag))
     }
 
+    pub fn in_project(&self, project: &str) -> bool {
+        self.project.as_deref().is_some_and(|p| p.eq_ignore_ascii_case(project))
+    }
+
+    pub fn in_component(&self, project: &str, component: &str) -> bool {
+        self.in_project(project)
+            && self.component.as_deref().is_some_and(|c| c.eq_ignore_ascii_case(component))
+    }
+
+    pub fn in_feature(&self, project: &str, component: &str, feature: &str) -> bool {
+        self.in_component(project, component)
+            && self.feature.as_deref().is_some_and(|f| f.eq_ignore_ascii_case(feature))
+    }
+
+    /// Set the project; changing it drops the component and feature, which belong to the old one.
+    pub fn set_project(&mut self, project: Option<String>) {
+        if self.project != project {
+            self.project = project;
+            self.component = None;
+            self.feature = None;
+        }
+    }
+
+    /// Set the component; changing it drops the feature. Needs a project.
+    pub fn set_component(&mut self, component: Option<String>) {
+        let component = component.filter(|_| self.project.is_some());
+        if self.component != component {
+            self.component = component;
+            self.feature = None;
+        }
+    }
+
+    /// Set the feature. Needs a component.
+    pub fn set_feature(&mut self, feature: Option<String>) {
+        self.feature = feature.filter(|_| self.component.is_some());
+    }
+
     /// Whether the card matches a search query.
     ///
     /// The query is split by whitespace and every term must match. `#tag`
-    /// matches tags by prefix, `is:note|todo|snippet|pinned|open|done` filters
-    /// on state, and any other term matches title, body, items or tags.
+    /// matches tags by prefix, `tag:name`, `project:name`, `component:name` and
+    /// `feature:name` match exactly (`project:none` finds cards without one),
+    /// `is:note|todo|snippet|pinned|open|done` filters on state, and any other
+    /// term matches title, body, items, tags, project, component or feature.
     pub fn matches(&self, query: &str) -> bool {
         query.split_whitespace().all(|term| {
             let term = term.to_lowercase();
             if let Some(tag) = term.strip_prefix('#') {
                 return self.tags.iter().any(|t| t.to_lowercase().starts_with(tag));
+            }
+            if let Some(tag) = term.strip_prefix("tag:") {
+                return self.has_tag(tag);
+            }
+            if let Some(project) = term.strip_prefix("project:") {
+                return match project {
+                    "none" => self.project.is_none(),
+                    _ => self.in_project(project),
+                };
+            }
+            if let Some(component) = term.strip_prefix("component:") {
+                return match component {
+                    "none" => self.component.is_none(),
+                    _ => self.component.as_deref().is_some_and(|c| c.eq_ignore_ascii_case(component)),
+                };
+            }
+            if let Some(feature) = term.strip_prefix("feature:") {
+                return match feature {
+                    "none" => self.feature.is_none(),
+                    _ => self.feature.as_deref().is_some_and(|f| f.eq_ignore_ascii_case(feature)),
+                };
             }
             if let Some(filter) = term.strip_prefix("is:") {
                 return match filter {
@@ -247,6 +319,9 @@ impl Card {
                 || self.body.to_lowercase().contains(&term)
                 || self.items.iter().any(|i| i.text.to_lowercase().contains(&term))
                 || self.tags.iter().any(|t| t.to_lowercase().contains(&term))
+                || self.project.as_deref().is_some_and(|p| p.contains(&term))
+                || self.component.as_deref().is_some_and(|c| c.contains(&term))
+                || self.feature.as_deref().is_some_and(|f| f.contains(&term))
         })
     }
 }
@@ -275,7 +350,31 @@ pub fn normalize_tag(raw: &str) -> Option<String> {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join("-");
+    let tag = tag.trim_matches('-').to_string();
     (!tag.is_empty()).then_some(tag)
+}
+
+/// Tag input as it is typed: spaces become single dashes, so `hello world`
+/// turns into `hello-world` instead of two tags.
+pub fn dash_spaces(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.trim_start().chars() {
+        if ch.is_whitespace() {
+            if !out.ends_with('-') {
+                out.push('-');
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// A named search kept in the sidebar.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SavedQuery {
+    pub name: String,
+    pub query: String,
 }
 
 pub fn truncate(s: &str, max: usize) -> String {
@@ -509,8 +608,37 @@ body".into();
     }
 
     #[test]
+    fn project_terms() {
+        let mut card = Card::new(CardKind::Todo);
+        card.project = Some("zettel".into());
+        card.component = Some("sidebar".into());
+        card.tags = vec!["ui".into()];
+        assert!(card.matches("project:zettel"));
+        assert!(!card.matches("project:zet"));
+        assert!(card.matches("project:Zettel component:sidebar"));
+        assert!(!card.matches("component:none"));
+        assert!(card.matches("tag:ui sidebar"));
+        assert!(!card.matches("tag:u"));
+        card.set_project(Some("other".into()));
+        assert_eq!(card.component, None);
+        assert!(card.matches("component:none"));
+        card.set_component(Some("store".into()));
+        card.set_feature(Some("yaml".into()));
+        assert!(card.matches("feature:yaml"));
+        assert!(card.in_feature("other", "store", "yaml"));
+        card.set_component(Some("sidebar".into()));
+        assert_eq!(card.feature, None);
+        card.set_project(None);
+        card.set_component(Some("sidebar".into()));
+        assert_eq!(card.component, None);
+    }
+
+    #[test]
     fn tags_normalize() {
         assert_eq!(normalize_tag(" #Deep Work "), Some("deep-work".into()));
         assert_eq!(normalize_tag("#"), None);
+        assert_eq!(normalize_tag("hello-"), Some("hello".into()));
+        assert_eq!(dash_spaces(" hello  world "), "hello-world-");
+        assert_eq!(dash_spaces("hello- world"), "hello-world");
     }
 }

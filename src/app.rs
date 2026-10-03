@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     path::PathBuf,
     time::{Duration, Instant},
 };
@@ -14,7 +14,7 @@ use gpui_kit::component::{
     h_flex,
     input::{Editor, EditorState, Input, InputEvent, InputState},
     kbd::Kbd,
-    menu::{DropdownMenu as _, PopupMenuItem},
+    menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem},
     notification::Notification,
     scroll::ScrollableElement as _,
     spinner::Spinner,
@@ -25,8 +25,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::model::{
-    Card, CardColor, CardKind, LANGUAGES, TodoItem, day_label, detect_language, fenced,
-    language_label, normalize_tag, relative_time, truncate,
+    Card, CardColor, CardKind, LANGUAGES, SavedQuery, TodoItem, dash_spaces, day_label,
+    detect_language, fenced, language_label, normalize_tag, relative_time, truncate,
 };
 use crate::store::{
     AppConfig, LoadedVault, Vault, VaultState, legacy_cards_path, load_legacy_cards,
@@ -85,6 +85,12 @@ enum Filter {
     OpenTodos,
     Pinned,
     Tag(String),
+    Project(String),
+    /// A component within a project.
+    Component(String, String),
+    /// A feature within a project's component.
+    Feature(String, String, String),
+    Saved(SavedQuery),
 }
 
 impl Filter {
@@ -95,6 +101,12 @@ impl Filter {
             Filter::OpenTodos => card.is_open_todo(),
             Filter::Pinned => card.pinned,
             Filter::Tag(tag) => card.has_tag(tag),
+            Filter::Project(project) => card.in_project(project),
+            Filter::Component(project, component) => card.in_component(project, component),
+            Filter::Feature(project, component, feature) => {
+                card.in_feature(project, component, feature)
+            }
+            Filter::Saved(saved) => card.matches(&saved.query),
         }
     }
 
@@ -105,8 +117,50 @@ impl Filter {
             Filter::OpenTodos => "Open todos".into(),
             Filter::Pinned => "Pinned".into(),
             Filter::Tag(tag) => format!("#{tag}"),
+            Filter::Project(project) => project.clone(),
+            Filter::Component(project, component) => format!("{project} › {component}"),
+            Filter::Feature(project, component, feature) => {
+                format!("{project} › {component} › {feature}")
+            }
+            Filter::Saved(saved) => saved.name.clone(),
         }
     }
+
+    /// The same filter as search terms, so it can be saved as a query.
+    fn as_query(&self) -> String {
+        match self {
+            Filter::All => String::new(),
+            Filter::Kind(kind) => format!("is:{}", kind.label().to_lowercase()),
+            Filter::OpenTodos => "is:open".into(),
+            Filter::Pinned => "is:pinned".into(),
+            Filter::Tag(tag) => format!("tag:{tag}"),
+            Filter::Project(project) => format!("project:{project}"),
+            Filter::Component(project, component) => {
+                format!("project:{project} component:{component}")
+            }
+            Filter::Feature(project, component, feature) => {
+                format!("project:{project} component:{component} feature:{feature}")
+            }
+            Filter::Saved(saved) => saved.query.clone(),
+        }
+    }
+}
+
+/// The sidebar form for creating or editing a saved query.
+#[derive(Clone, Copy, PartialEq)]
+struct QueryForm {
+    /// The saved query being edited; `None` creates a new one.
+    index: Option<usize>,
+}
+
+/// Sidebar sections that can be collapsed.
+const SAVED_SECTION: &str = "SAVED";
+const PROJECTS_SECTION: &str = "PROJECTS";
+const TAGS_SECTION: &str = "TAGS";
+
+/// Key of a component in the set of expanded sidebar entries.
+fn component_key(project: &str, component: &str) -> String {
+    format!("{project}/{component}")
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -131,12 +185,28 @@ struct Stats {
     open_todos: usize,
     kinds: [usize; 3],
     tags: BTreeMap<String, usize>,
+    projects: BTreeMap<String, ProjectStats>,
+    /// Saved query → matching cards.
+    saved: HashMap<String, usize>,
+}
+
+#[derive(Default)]
+struct ProjectStats {
+    count: usize,
+    components: BTreeMap<String, ComponentStats>,
+}
+
+#[derive(Default)]
+struct ComponentStats {
+    count: usize,
+    features: BTreeMap<String, usize>,
 }
 
 impl Stats {
-    fn compute(cards: &[Card]) -> Self {
+    fn compute(cards: &[Card], queries: &[SavedQuery]) -> Self {
         let mut stats = Stats {
             all: cards.len(),
+            saved: queries.iter().map(|q| (q.query.clone(), 0)).collect(),
             ..Default::default()
         };
         for card in cards {
@@ -145,6 +215,20 @@ impl Stats {
             stats.kinds[card.kind as usize] += 1;
             for tag in &card.tags {
                 *stats.tags.entry(tag.clone()).or_insert(0) += 1;
+            }
+            if let Some(project) = &card.project {
+                let entry = stats.projects.entry(project.clone()).or_default();
+                entry.count += 1;
+                if let Some(component) = &card.component {
+                    let entry = entry.components.entry(component.clone()).or_default();
+                    entry.count += 1;
+                    if let Some(feature) = &card.feature {
+                        *entry.features.entry(feature.clone()).or_insert(0) += 1;
+                    }
+                }
+            }
+            for (query, count) in stats.saved.iter_mut() {
+                *count += usize::from(card.matches(query));
             }
         }
         stats
@@ -157,13 +241,49 @@ impl Stats {
             Filter::OpenTodos => self.open_todos,
             Filter::Pinned => self.pinned,
             Filter::Tag(tag) => self.tags.get(tag).copied().unwrap_or(0),
+            Filter::Project(project) => self.projects.get(project).map_or(0, |p| p.count),
+            Filter::Component(project, component) => self
+                .component(project, component)
+                .map_or(0, |c| c.count),
+            Filter::Feature(project, component, feature) => self
+                .component(project, component)
+                .and_then(|c| c.features.get(feature))
+                .copied()
+                .unwrap_or(0),
+            Filter::Saved(saved) => self.saved.get(&saved.query).copied().unwrap_or(0),
         }
+    }
+
+    fn component(&self, project: &str, component: &str) -> Option<&ComponentStats> {
+        self.projects.get(project)?.components.get(component)
     }
 }
 
 /// The parts of a card that the sidebar counts depend on.
-fn stats_key(card: &Card) -> (CardKind, bool, bool, Vec<String>) {
-    (card.kind, card.pinned, card.is_open_todo(), card.tags.clone())
+#[derive(PartialEq)]
+struct StatsKey {
+    kind: CardKind,
+    pinned: bool,
+    open: bool,
+    tags: Vec<String>,
+    project: Option<String>,
+    component: Option<String>,
+    feature: Option<String>,
+    /// Which saved queries the card matches.
+    saved: Vec<bool>,
+}
+
+fn stats_key(card: &Card, queries: &[SavedQuery]) -> StatsKey {
+    StatsKey {
+        kind: card.kind,
+        pinned: card.pinned,
+        open: card.is_open_todo(),
+        tags: card.tags.clone(),
+        project: card.project.clone(),
+        component: card.component.clone(),
+        feature: card.feature.clone(),
+        saved: queries.iter().map(|q| card.matches(&q.query)).collect(),
+    }
 }
 
 /// A second click this soon after opening a card counts as a double click on it.
@@ -204,6 +324,12 @@ pub struct ZettelApp {
     stats: Stats,
     filter: Filter,
     query: String,
+    /// Searches saved in the sidebar, belonging to the vault.
+    queries: Vec<SavedQuery>,
+    /// Projects (and `project/component`s) whose children the sidebar shows.
+    expanded: HashSet<String>,
+    /// Set while the sidebar shows the saved query form.
+    query_form: Option<QueryForm>,
     selected: Option<String>,
     /// Show the rendered markdown instead of the source in the editor.
     preview: bool,
@@ -219,7 +345,13 @@ pub struct ZettelApp {
     body: Entity<EditorState>,
     body_language: SharedString,
     tag_input: Entity<InputState>,
+    project_input: Entity<InputState>,
+    component_input: Entity<InputState>,
+    feature_input: Entity<InputState>,
     item_input: Entity<InputState>,
+    /// Fields of the saved query form.
+    query_name: Entity<InputState>,
+    query_text: Entity<InputState>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -234,7 +366,7 @@ impl ZettelApp {
 
         let search = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Search cards…  #tag  is:open  lang:rust")
+                .placeholder("Search cards…  #tag  project:name  is:open  lang:rust")
                 .clean_on_escape()
         });
         let title = cx.new(|cx| InputState::new(window, cx).placeholder("Untitled"));
@@ -247,6 +379,13 @@ impl ZettelApp {
                 .placeholder("Start writing… Markdown is supported")
         });
         let tag_input = cx.new(|cx| InputState::new(window, cx).placeholder("Add tag…"));
+        let project_input = cx.new(|cx| InputState::new(window, cx).placeholder("Project…"));
+        let component_input = cx.new(|cx| InputState::new(window, cx).placeholder("Component…"));
+        let feature_input = cx.new(|cx| InputState::new(window, cx).placeholder("Feature…"));
+        let query_name = cx.new(|cx| InputState::new(window, cx).placeholder("Display name"));
+        let query_text = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Query, e.g. project:app is:open")
+        });
         let item_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("Add a task and press Enter…")
         });
@@ -281,16 +420,23 @@ impl ZettelApp {
             }),
             cx.subscribe_in(&tag_input, window, |this, state, event, window, cx| {
                 let value = state.read(cx).value().to_string();
-                let commit = match event {
-                    InputEvent::PressEnter { .. } | InputEvent::Blur => true,
-                    InputEvent::Change => value.contains(',') || value.ends_with(' '),
-                    _ => false,
-                };
+                // Spaces join words (`hello world` → `hello-world`); a comma
+                // or Enter finishes the tag.
+                if let InputEvent::Change = event
+                    && !value.contains(',')
+                {
+                    let dashed = dash_spaces(&value);
+                    if dashed != value {
+                        state.update(cx, |state, cx| state.set_value(dashed, window, cx));
+                    }
+                    return;
+                }
+                let commit = matches!(
+                    event,
+                    InputEvent::PressEnter { .. } | InputEvent::Blur | InputEvent::Change
+                );
                 if commit && !value.trim().is_empty() {
-                    let tags: Vec<String> = value
-                        .split([',', ' '])
-                        .filter_map(normalize_tag)
-                        .collect();
+                    let tags: Vec<String> = value.split(',').filter_map(normalize_tag).collect();
                     this.update_selected(cx, |card| {
                         for tag in tags {
                             if !card.has_tag(&tag) {
@@ -300,6 +446,35 @@ impl ZettelApp {
                     });
                     state.update(cx, |state, cx| state.set_value("", window, cx));
                 }
+            }),
+            cx.subscribe_in(&project_input, window, |this, state, event, window, cx| {
+                if let InputEvent::PressEnter { .. } | InputEvent::Blur = event {
+                    let project = normalize_tag(&state.read(cx).value());
+                    this.set_project(project, window, cx);
+                }
+            }),
+            cx.subscribe_in(&component_input, window, |this, state, event, window, cx| {
+                if let InputEvent::PressEnter { .. } | InputEvent::Blur = event {
+                    let component = normalize_tag(&state.read(cx).value());
+                    this.set_component(component, window, cx);
+                }
+            }),
+            cx.subscribe_in(&feature_input, window, |this, state, event, window, cx| {
+                if let InputEvent::PressEnter { .. } | InputEvent::Blur = event {
+                    let feature = normalize_tag(&state.read(cx).value());
+                    this.set_feature(feature, window, cx);
+                }
+            }),
+            cx.subscribe_in(&query_name, window, |this, _, event, window, cx| {
+                if let InputEvent::PressEnter { .. } = event {
+                    this.submit_query_form(window, cx);
+                }
+            }),
+            cx.subscribe_in(&query_text, window, |this, _, event, window, cx| match event {
+                InputEvent::PressEnter { .. } => this.submit_query_form(window, cx),
+                // The form shows how many cards match.
+                InputEvent::Change => cx.notify(),
+                _ => {}
             }),
             cx.subscribe_in(&item_input, window, |this, state, event, window, cx| {
                 if let InputEvent::PressEnter { .. } = event {
@@ -326,6 +501,9 @@ impl ZettelApp {
             stats: Stats::default(),
             filter: Filter::All,
             query: String::new(),
+            queries: Vec::new(),
+            expanded: HashSet::new(),
+            query_form: None,
             selected: None,
             preview: false,
             opened_at: None,
@@ -338,7 +516,12 @@ impl ZettelApp {
             body,
             body_language: "markdown".into(),
             tag_input,
+            project_input,
+            component_input,
+            feature_input,
             item_input,
+            query_name,
+            query_text,
             _subscriptions: subscriptions,
         };
         if let Some(path) = this.config.last_vault.clone().filter(|p| p.is_dir()) {
@@ -405,14 +588,14 @@ impl ZettelApp {
         let row_key = |this: &Self, card: &Card| {
             (this.filter.accepts(card) && card.matches(&this.query), card.pinned)
         };
-        let before = (row_key(self, &self.cards[ix]), stats_key(&self.cards[ix]));
+        let before = (row_key(self, &self.cards[ix]), stats_key(&self.cards[ix], &self.queries));
         f(&mut self.cards[ix]);
         self.cards[ix].touch();
-        let after = (row_key(self, &self.cards[ix]), stats_key(&self.cards[ix]));
+        let after = (row_key(self, &self.cards[ix]), stats_key(&self.cards[ix], &self.queries));
 
         self.persist(id, None, cx);
         if before.1 != after.1 {
-            self.stats = Stats::compute(&self.cards);
+            self.stats = Stats::compute(&self.cards, &self.queries);
         }
         if before.0 != after.0 {
             // The card entered, left or moved within the list.
@@ -483,7 +666,7 @@ impl ZettelApp {
             .enumerate()
             .map(|(ix, c)| (c.id.clone(), ix))
             .collect();
-        self.stats = Stats::compute(&self.cards);
+        self.stats = Stats::compute(&self.cards, &self.queries);
         let rows = crate::profile::time("compute_rows", || self.compute_rows());
         self.visible_count = rows.iter().filter(|r| matches!(r, Row::Card(_))).count();
         if reset {
@@ -551,8 +734,19 @@ impl ZettelApp {
         if let Some(body) = body {
             card.body = body;
         }
-        if let Filter::Tag(tag) = &self.filter {
-            card.tags.push(tag.clone());
+        match &self.filter {
+            Filter::Tag(tag) => card.tags.push(tag.clone()),
+            Filter::Project(project) => card.project = Some(project.clone()),
+            Filter::Component(project, component) => {
+                card.project = Some(project.clone());
+                card.component = Some(component.clone());
+            }
+            Filter::Feature(project, component, feature) => {
+                card.project = Some(project.clone());
+                card.component = Some(component.clone());
+                card.feature = Some(feature.clone());
+            }
+            _ => {}
         }
         // Make sure the new card is visible.
         let reset = !self.filter.accepts(&card);
@@ -589,6 +783,7 @@ impl ZettelApp {
         self.configure_body(&card, window, cx);
         self.tag_input.update(cx, |s, cx| s.set_value("", window, cx));
         self.item_input.update(cx, |s, cx| s.set_value("", window, cx));
+        self.sync_project_inputs(window, cx);
         cx.notify();
     }
 
@@ -652,6 +847,8 @@ impl ZettelApp {
         if let Some(vault) = &self.vault {
             let state = VaultState {
                 minimized: self.ui.minimized.clone(),
+                queries: self.queries.clone(),
+                expanded_projects: self.expanded.iter().cloned().collect(),
             };
             if let Err(err) = vault.save_state(&state) {
                 eprintln!("Saving vault state failed: {err}");
@@ -777,8 +974,185 @@ impl ZettelApp {
 
     fn set_filter(&mut self, filter: Filter, window: &mut Window, cx: &mut Context<Self>) {
         self.hide(window, cx);
+        // Picking a project or component shows what is inside it.
+        let key = match &filter {
+            Filter::Project(project) => Some(project.clone()),
+            Filter::Component(project, component) => Some(component_key(project, component)),
+            _ => None,
+        };
+        if let Some(key) = key
+            && self.expanded.insert(key)
+        {
+            self.save_settings();
+        }
         self.filter = filter;
         self.refresh_rows(true, None);
+        cx.notify();
+    }
+
+    fn is_collapsed(&self, section: &str) -> bool {
+        self.config.collapsed_sections.iter().any(|s| s == section)
+    }
+
+    fn toggle_section(&mut self, section: &str, cx: &mut Context<Self>) {
+        if self.is_collapsed(section) {
+            self.config.collapsed_sections.retain(|s| s != section);
+        } else {
+            self.config.collapsed_sections.push(section.to_string());
+        }
+        self.save_settings();
+        cx.notify();
+    }
+
+    // ----- projects ---------------------------------------------------------
+
+    fn set_project(&mut self, project: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        // Blur also commits, so ignore it when nothing changed.
+        if self.selected_card().is_some_and(|c| c.project != project) {
+            self.update_selected(cx, |card| card.set_project(project));
+        }
+        self.sync_project_inputs(window, cx);
+    }
+
+    fn set_component(&mut self, component: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(card) = self.selected_card() else {
+            return;
+        };
+        let component = component.filter(|_| card.project.is_some());
+        if card.component != component {
+            self.update_selected(cx, |card| card.set_component(component));
+        }
+        self.sync_project_inputs(window, cx);
+    }
+
+    fn set_feature(&mut self, feature: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(card) = self.selected_card() else {
+            return;
+        };
+        let feature = feature.filter(|_| card.component.is_some());
+        if card.feature != feature {
+            self.update_selected(cx, |card| card.set_feature(feature));
+        }
+        self.sync_project_inputs(window, cx);
+    }
+
+    /// Show the open card's project, component and feature in the editor inputs.
+    fn sync_project_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let card = self.selected_card();
+        let value = |f: fn(&Card) -> &Option<String>| card.and_then(|c| f(c).clone()).unwrap_or_default();
+        let fields = [
+            (&self.project_input, value(|c| &c.project)),
+            (&self.component_input, value(|c| &c.component)),
+            (&self.feature_input, value(|c| &c.feature)),
+        ];
+        for (input, value) in fields {
+            input.update(cx, |s, cx| {
+                if s.value() != value.as_str() {
+                    s.set_value(value, window, cx);
+                }
+            });
+        }
+    }
+
+    /// Show or hide the children of a project or `project/component`.
+    fn toggle_expanded(&mut self, key: &str, cx: &mut Context<Self>) {
+        if !self.expanded.remove(key) {
+            self.expanded.insert(key.to_string());
+        }
+        self.save_settings();
+        cx.notify();
+    }
+
+    // ----- saved queries ----------------------------------------------------
+
+    /// The current filter and search as one query.
+    fn current_query(&self) -> String {
+        let filter = self.filter.as_query();
+        let search = self.query.split_whitespace().collect::<Vec<_>>().join(" ");
+        [filter, search]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Open the saved query form: a new query starts from the current view.
+    fn open_query_form(&mut self, index: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        let (name, query) = match index.and_then(|ix| self.queries.get(ix)) {
+            Some(saved) => (saved.name.clone(), saved.query.clone()),
+            None if index.is_some() => return,
+            None => (String::new(), self.current_query()),
+        };
+        // One popup at a time.
+        self.hide(window, cx);
+        self.query_form = Some(QueryForm { index });
+        self.query_text.update(cx, |s, cx| s.set_value(query, window, cx));
+        self.query_name.update(cx, |s, cx| {
+            s.set_value(name, window, cx);
+            s.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    /// Fill the form's query with the current filter and search.
+    fn use_current_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let query = self.current_query();
+        self.query_text.update(cx, |s, cx| s.set_value(query, window, cx));
+        cx.notify();
+    }
+
+    fn form_query(&self, cx: &App) -> String {
+        let text = self.query_text.read(cx).value().to_string();
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    fn submit_query_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(form) = self.query_form else {
+            return;
+        };
+        let query = self.form_query(cx);
+        if query.is_empty() {
+            self.query_text.update(cx, |s, cx| s.focus(window, cx));
+            return;
+        }
+        let name = self.query_name.read(cx).value().trim().to_string();
+        let saved = SavedQuery {
+            name: if name.is_empty() { query.clone() } else { name },
+            query,
+        };
+        match form.index {
+            Some(ix) if ix < self.queries.len() => self.queries[ix] = saved.clone(),
+            _ => {
+                self.queries.push(saved.clone());
+                // A new query usually holds the search it was made from.
+                self.query.clear();
+                self.search.update(cx, |s, cx| s.set_value("", window, cx));
+            }
+        }
+        self.query_form = None;
+        self.save_settings();
+        self.focus_handle.focus(window, cx);
+        self.set_filter(Filter::Saved(saved), window, cx);
+    }
+
+    fn close_query_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.query_form.take().is_some() {
+            self.focus_handle.focus(window, cx);
+            cx.notify();
+        }
+    }
+
+    fn delete_query(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if ix >= self.queries.len() {
+            return;
+        }
+        let saved = self.queries.remove(ix);
+        // The form's index would now point at another query.
+        self.query_form = None;
+        self.save_settings();
+        if self.filter == Filter::Saved(saved) {
+            self.set_filter(Filter::All, window, cx);
+        }
         cx.notify();
     }
 
@@ -849,11 +1223,14 @@ impl ZettelApp {
         self.filter = Filter::All;
         self.query.clear();
         self.search.update(cx, |s, cx| s.set_value("", window, cx));
+        self.query_form = None;
         self.cards = cards;
         self.sort();
+        let state = vault.load_state();
+        self.queries = state.queries;
+        self.expanded = state.expanded_projects.into_iter().collect();
         self.refresh_rows(true, None);
-        self.ui.minimized = vault
-            .load_state()
+        self.ui.minimized = state
             .minimized
             .into_iter()
             .filter(|id| self.cards.iter().any(|c| c.id == *id))
@@ -887,6 +1264,10 @@ impl ZettelApp {
         self.save_settings();
         self.vault = None;
         self.cards.clear();
+        self.queries.clear();
+        self.expanded.clear();
+        self.query_form = None;
+        self.filter = Filter::All;
         self.refresh_rows(true, None);
         self.ui.minimized.clear();
         self.undo = None;
@@ -993,6 +1374,10 @@ impl ZettelApp {
     }
 
     fn on_close_editor(&mut self, _: &CloseEditor, window: &mut Window, cx: &mut Context<Self>) {
+        if self.query_form.is_some() {
+            self.close_query_form(window, cx);
+            return;
+        }
         self.hide(window, cx);
     }
 
@@ -1055,11 +1440,13 @@ impl ZettelApp {
         let theme = cx.theme().clone();
         let count = |f: &Filter| self.stats.count(f);
 
-        let nav_item = |id: &'static str,
+        // `leading` goes before the icon: a project's chevron or a component's indent.
+        let nav_item = |id: &str,
                         icon: IconName,
                         label: String,
                         filter: Filter,
                         highlight: Option<Hsla>,
+                        leading: Option<AnyElement>,
                         cx: &mut Context<Self>| {
             let theme = cx.theme().clone();
             let active = self.filter == filter;
@@ -1075,6 +1462,7 @@ impl ZettelApp {
                 .text_color(if active { theme.foreground } else { theme.muted_foreground })
                 .when(active, |s| s.bg(theme.sidebar_accent).font_medium())
                 .hover(|s| s.bg(theme.sidebar_accent).text_color(theme.foreground))
+                .children(leading)
                 .child(Icon::new(icon).small())
                 .child(div().flex_1().truncate().child(label))
                 .child(match highlight.filter(|_| n > 0) {
@@ -1108,41 +1496,78 @@ impl ZettelApp {
                 .child(label)
         };
 
-        let tags = &self.stats.tags;
+        // A section header that collapses its list; `extra` sits next to the chevron.
+        let collapsible = |label: &'static str, extra: Option<AnyElement>, cx: &mut Context<Self>| {
+            let collapsed = self.is_collapsed(label);
+            h_flex()
+                .id(SharedString::from(format!("section-{label}")))
+                .gap_1()
+                .px_2p5()
+                .pt_4()
+                .pb_1p5()
+                .text_xs()
+                .font_medium()
+                .cursor_pointer()
+                .text_color(theme.muted_foreground.opacity(0.8))
+                .hover(|s| s.text_color(theme.foreground))
+                .child(div().flex_1().child(label))
+                .children(extra)
+                .child(
+                    Icon::new(if collapsed { IconName::ChevronRight } else { IconName::ChevronDown })
+                        .xsmall(),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| this.toggle_section(label, cx)))
+        };
+
         let mut tag_list = v_flex().gap_0p5();
-        if tags.is_empty() {
-            tag_list = tag_list.child(
-                div()
-                    .px_2p5()
-                    .py_1()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child("No tags yet — add some in the editor."),
-            );
-        }
-        for tag in tags.keys() {
+        for tag in self.stats.tags.keys() {
             tag_list = tag_list.child(nav_item(
                 "tag",
                 IconName::Hash,
                 tag.clone(),
                 Filter::Tag(tag.clone()),
                 None,
+                None,
                 cx,
             ));
         }
+
+        let projects = self.render_projects(&nav_item, cx);
+        let saved = self.render_saved_queries(&nav_item, cx);
+        let add_query = div()
+            .id("add-query")
+            .size_4()
+            .rounded(px(3.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .hover(|s| s.bg(theme.foreground.opacity(0.1)))
+            .child(Icon::new(IconName::Plus).xsmall())
+            .tooltip(|window, cx| {
+                gpui_kit::component::tooltip::Tooltip::new("Save the current filter and search")
+                    .build(window, cx)
+            })
+            .on_click(cx.listener(|this, _, window, cx| {
+                cx.stop_propagation();
+                this.open_query_form(None, window, cx);
+            }));
+        let saved_header = collapsible(SAVED_SECTION, Some(add_query.into_any_element()), cx);
+        let projects_header = collapsible(PROJECTS_SECTION, None, cx);
+        let tags_header = collapsible(TAGS_SECTION, None, cx);
 
         let vault_root = self.vault.as_ref().map(|v| v.root().to_path_buf()).unwrap_or_default();
         let path = vault_root.clone();
         let mut library = v_flex()
             .gap_0p5()
-            .child(nav_item("all", IconName::Layers, "All cards".into(), Filter::All, None, cx))
-            .child(nav_item("pinned", IconName::Pin, "Pinned".into(), Filter::Pinned, None, cx));
+            .child(nav_item("all", IconName::Layers, "All cards".into(), Filter::All, None, None, cx))
+            .child(nav_item("pinned", IconName::Pin, "Pinned".into(), Filter::Pinned, None, None, cx));
         for kind in CardKind::ALL {
             library = library.child(nav_item(
                 "kind",
                 kind_icon(kind),
                 kind.plural().into(),
                 Filter::Kind(kind),
+                None,
                 None,
                 cx,
             ));
@@ -1153,6 +1578,7 @@ impl ZettelApp {
             "Open todos".into(),
             Filter::OpenTodos,
             Some(accent(CardColor::Yellow)),
+            None,
             cx,
         );
 
@@ -1172,8 +1598,12 @@ impl ZettelApp {
                     .child(library)
                     .child(section("FOCUS"))
                     .child(open)
-                    .child(section("TAGS"))
-                    .child(tag_list),
+                    .child(saved_header)
+                    .when(!self.is_collapsed(SAVED_SECTION), |s| s.child(saved))
+                    .child(projects_header)
+                    .when(!self.is_collapsed(PROJECTS_SECTION), |s| s.child(projects))
+                    .child(tags_header)
+                    .when(!self.is_collapsed(TAGS_SECTION), |s| s.child(tag_list)),
             )
             .child(
                 h_flex()
@@ -1202,6 +1632,338 @@ impl ZettelApp {
                     .on_click(move |_, _, cx| cx.open_with_system(&vault_root)),
             )
             .into_any_element()
+    }
+
+    /// Projects, with components and their features nested below when expanded.
+    fn render_projects(
+        &self,
+        nav_item: &impl Fn(&str, IconName, String, Filter, Option<Hsla>, Option<AnyElement>, &mut Context<Self>) -> Stateful<Div>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().clone();
+        const INDENT: f32 = 14.;
+        // Indent plus a chevron that expands `key`, or an empty slot of the same width.
+        let leading = |depth: usize, key: Option<(String, bool)>, cx: &mut Context<Self>| {
+            let slot = div()
+                .id(SharedString::from(format!("toggle-{}", key.as_ref().map_or("", |k| k.0.as_str()))))
+                .flex_none()
+                .size_4()
+                .rounded(px(3.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .when_some(key, |s, (key, expanded)| {
+                    s.hover(|s| s.bg(theme.foreground.opacity(0.1)))
+                        .child(
+                            Icon::new(if expanded { IconName::ChevronDown } else { IconName::ChevronRight })
+                                .xsmall(),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.toggle_expanded(&key, cx);
+                            }),
+                        )
+                });
+            h_flex()
+                .flex_none()
+                .pl(px(INDENT * depth as f32))
+                .child(slot)
+                .into_any_element()
+        };
+
+        let mut list = v_flex().gap_0p5();
+        for (project, stats) in &self.stats.projects {
+            let expanded = self.expanded.contains(project);
+            let toggle = (!stats.components.is_empty()).then(|| (project.clone(), expanded));
+            list = list.child(nav_item(
+                "project",
+                IconName::Folder,
+                project.clone(),
+                Filter::Project(project.clone()),
+                None,
+                Some(leading(0, toggle, cx)),
+                cx,
+            ));
+            if !expanded {
+                continue;
+            }
+            for (component, component_stats) in &stats.components {
+                let key = component_key(project, component);
+                let expanded = self.expanded.contains(&key);
+                let toggle = (!component_stats.features.is_empty()).then(|| (key.clone(), expanded));
+                list = list.child(nav_item(
+                    &format!("component-{project}"),
+                    IconName::Component,
+                    component.clone(),
+                    Filter::Component(project.clone(), component.clone()),
+                    None,
+                    Some(leading(1, toggle, cx)),
+                    cx,
+                ));
+                if !expanded {
+                    continue;
+                }
+                for feature in component_stats.features.keys() {
+                    list = list.child(nav_item(
+                        &format!("feature-{key}"),
+                        IconName::Flag,
+                        feature.clone(),
+                        Filter::Feature(project.clone(), component.clone(), feature.clone()),
+                        None,
+                        Some(leading(2, None, cx)),
+                        cx,
+                    ));
+                }
+            }
+        }
+        list.into_any_element()
+    }
+
+    /// Saved queries, with an edit button on hover and a context menu.
+    fn render_saved_queries(
+        &self,
+        nav_item: &impl Fn(&str, IconName, String, Filter, Option<Hsla>, Option<AnyElement>, &mut Context<Self>) -> Stateful<Div>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().clone();
+        let mut list = v_flex().gap_0p5();
+        let this = cx.entity().downgrade();
+        for (ix, saved) in self.queries.iter().enumerate() {
+            let query = saved.query.clone();
+            let group: SharedString = format!("saved-{ix}").into();
+            let this = this.clone();
+            // Covers the count on hover, so it takes no room otherwise.
+            let edit = div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .right(px(6.))
+                .flex()
+                .items_center()
+                .opacity(0.)
+                .group_hover(group.clone(), |s| s.opacity(1.))
+                .child(
+                    div()
+                        .id(SharedString::from(format!("edit-saved-{ix}")))
+                        .size_5()
+                        .rounded(px(4.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(theme.sidebar_accent)
+                        .hover(|s| s.bg(theme.foreground.opacity(0.15)))
+                        .child(Icon::new(IconName::Pencil).xsmall())
+                        .tooltip(|window, cx| {
+                            gpui_kit::component::tooltip::Tooltip::new("Edit name and query")
+                                .build(window, cx)
+                        })
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.open_query_form(Some(ix), window, cx);
+                            }),
+                        ),
+                );
+            let item = nav_item(
+                &format!("saved-{ix}"),
+                IconName::Bookmark,
+                saved.name.clone(),
+                Filter::Saved(saved.clone()),
+                None,
+                None,
+                cx,
+            )
+            .group(group)
+            .relative()
+            .child(edit)
+            .tooltip(move |window, cx| {
+                gpui_kit::component::tooltip::Tooltip::new(query.clone()).build(window, cx)
+            })
+            .context_menu(move |menu, _, _| {
+                let action = |f: fn(&mut Self, usize, &mut Window, &mut Context<Self>)| {
+                    let this = this.clone();
+                    move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                        let _ = this.update(cx, |this, cx| f(this, ix, window, cx));
+                    }
+                };
+                menu.item(PopupMenuItem::new("Edit…").icon(IconName::Pencil).on_click(action(
+                    |this, ix, window, cx| this.open_query_form(Some(ix), window, cx),
+                )))
+                .separator()
+                .item(
+                    PopupMenuItem::new("Delete")
+                        .icon(IconName::Trash)
+                        .on_click(action(Self::delete_query)),
+                )
+            });
+            list = list.child(item);
+        }
+        list.into_any_element()
+    }
+
+    /// Dialog for a saved query's display name and query, with a live match count.
+    fn render_query_dialog(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let form = self.query_form?;
+        let theme = cx.theme().clone();
+        let query = self.form_query(cx);
+        let matches = if query.is_empty() {
+            "Type a query to see what it matches".to_string()
+        } else {
+            match self.cards.iter().filter(|c| c.matches(&query)).count() {
+                0 => "No cards match".to_string(),
+                1 => "1 card matches".to_string(),
+                n => format!("{n} cards match"),
+            }
+        };
+        let field = |label: &'static str, hint: &'static str, input: AnyElement| {
+            v_flex()
+                .gap_1p5()
+                .child(
+                    h_flex()
+                        .justify_between()
+                        .child(div().text_sm().font_medium().child(label))
+                        .child(div().text_xs().text_color(theme.muted_foreground).child(hint)),
+                )
+                .child(input)
+        };
+        let term = |syntax: &'static str, meaning: &'static str| {
+            h_flex()
+                .gap_2()
+                .child(
+                    div()
+                        .w(px(150.))
+                        .flex_none()
+                        .font_family(theme.mono_font_family.clone())
+                        .text_color(theme.foreground.opacity(0.85))
+                        .child(syntax),
+                )
+                .child(div().text_color(theme.muted_foreground).child(meaning))
+        };
+        let animation = || Animation::new(Duration::from_millis(160)).with_easing(ease_out_quint());
+
+        let dialog = v_flex()
+            .id("query-dialog")
+            .w(px(480.))
+            .max_w(relative(0.9))
+            .gap_4()
+            .p_5()
+            .rounded(modal_radius(&theme))
+            .bg(theme.popover)
+            .border_1()
+            .border_color(theme.border)
+            .shadow_2xl()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(Icon::new(IconName::Bookmark).small().text_color(theme.muted_foreground))
+                    .child(div().flex_1().text_lg().font_semibold().child(match form.index {
+                        Some(_) => "Edit saved query",
+                        None => "New saved query",
+                    }))
+                    .child(
+                        Button::new("close-query-dialog")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::X)
+                            .on_click(cx.listener(|this, _, window, cx| this.close_query_form(window, cx))),
+                    ),
+            )
+            .child(field(
+                "Display name",
+                "Shown in the sidebar",
+                Input::new(&self.query_name).into_any_element(),
+            ))
+            .child(field(
+                "Query",
+                "Which cards it shows",
+                Input::new(&self.query_text)
+                    .prefix(Icon::new(IconName::Search).small().text_color(theme.muted_foreground))
+                    .into_any_element(),
+            ))
+            .child(
+                h_flex()
+                    .justify_between()
+                    .text_sm()
+                    .child(div().text_color(theme.muted_foreground).child(matches))
+                    .child(
+                        Button::new("use-current-view")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Funnel)
+                            .label("Use current view")
+                            .tooltip("Fill in the current sidebar filter and search")
+                            .on_click(cx.listener(|this, _, window, cx| this.use_current_view(window, cx))),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .p_3()
+                    .rounded(theme.radius)
+                    .bg(theme.muted.opacity(0.5))
+                    .text_xs()
+                    .child(term("words", "Text in title, body, tasks or tags"))
+                    .child(term("#tag", "Tag starting with this"))
+                    .child(term("tag:name", "Exactly this tag"))
+                    .child(term("project:name", "Also component:, feature:"))
+                    .child(term("project:none", "Cards without a project"))
+                    .child(term("is:open", "Also note, todo, snippet, pinned, done"))
+                    .child(term("lang:rust", "Snippets in a language")),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .when_some(form.index, |s, ix| {
+                        s.child(
+                            Button::new("delete-query")
+                                .ghost()
+                                .small()
+                                .icon(IconName::Trash)
+                                .label("Delete")
+                                .on_click(cx.listener(move |this, _, window, cx| this.delete_query(ix, window, cx))),
+                        )
+                    })
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("cancel-query")
+                            .ghost()
+                            .small()
+                            .label("Cancel")
+                            .on_click(cx.listener(|this, _, window, cx| this.close_query_form(window, cx))),
+                    )
+                    .child(
+                        Button::new("save-query")
+                            .primary()
+                            .small()
+                            .label("Save")
+                            .on_click(cx.listener(|this, _, window, cx| this.submit_query_form(window, cx))),
+                    ),
+            )
+            .with_animation("query-dialog-in", animation(), |el, t| {
+                el.opacity(t).mt(px(14. * (1. - t)))
+            });
+
+        Some(
+            div()
+                .id("query-dialog-backdrop")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui_kit::black().opacity(0.55))
+                .occlude()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| this.close_query_form(window, cx)),
+                )
+                .child(dialog)
+                .into_any_element(),
+        )
     }
 
     fn render_resize_handle(&self, which: Resizing, cx: &mut Context<Self>) -> AnyElement {
@@ -1278,7 +2040,33 @@ impl ZettelApp {
                                     })
                                     .when(open_todos > 0 && self.filter != Filter::OpenTodos, |s| {
                                         s.child(format!(" · {open_todos} open todos"))
-                                    }),
+                                    })
+                                    .when_some(
+                                        match &self.filter {
+                                            Filter::Saved(saved) => self
+                                                .queries
+                                                .iter()
+                                                .position(|q| q == saved)
+                                                .map(|ix| (ix, saved.query.clone())),
+                                            _ => None,
+                                        },
+                                        |s, (ix, query)| {
+                                            s.child(div().truncate().child(format!(" · {query}")))
+                                                .child(
+                                                    div()
+                                                        .id("edit-active-query")
+                                                        .ml_2()
+                                                        .flex_none()
+                                                        .cursor_pointer()
+                                                        .text_color(theme.link)
+                                                        .hover(|s| s.underline())
+                                                        .child("Edit")
+                                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                                            this.open_query_form(Some(ix), window, cx)
+                                                        })),
+                                                )
+                                        },
+                                    ),
                             ),
                     )
                     .child(
@@ -1624,6 +2412,7 @@ impl ZettelApp {
             .gap_1()
             .flex_wrap()
             .items_center()
+            .children(self.render_project_chip(card, cx))
             .children(
                 card.tags
                     .iter()
@@ -1829,6 +2618,100 @@ impl ZettelApp {
             .into_any_element()
     }
 
+    /// Project or component of a card: links to its filter.
+    fn render_project_chip(&self, card: &Card, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let project = card.project.clone()?;
+        let theme = cx.theme().clone();
+        // Links to the deepest level the card has.
+        let filter = match (card.component.clone(), card.feature.clone()) {
+            (Some(component), Some(feature)) => Filter::Feature(project, component, feature),
+            (Some(component), None) => Filter::Component(project, component),
+            _ => Filter::Project(project),
+        };
+        let label = filter.title();
+        Some(
+            h_flex()
+                .id(SharedString::from(format!("project-{}", card.id)))
+                .gap_1()
+                .px_2()
+                .py(px(1.))
+                .rounded_full()
+                .text_xs()
+                .bg(theme.foreground.opacity(0.06))
+                .border_1()
+                .border_color(theme.foreground.opacity(0.08))
+                .text_color(theme.muted_foreground)
+                .hover(|s| s.text_color(theme.foreground).bg(theme.foreground.opacity(0.12)))
+                .child(Icon::new(IconName::Folder).size(px(11.)))
+                .child(label)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.set_filter(filter.clone(), window, cx);
+                    }),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Text input for a project or component, with a menu of the existing ones.
+    #[allow(clippy::too_many_arguments)]
+    fn render_project_field(
+        &self,
+        id: &'static str,
+        input: &Entity<InputState>,
+        icon: IconName,
+        none_label: &'static str,
+        current: Option<String>,
+        options: Vec<String>,
+        set: fn(&mut Self, Option<String>, &mut Window, &mut Context<Self>),
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().clone();
+        let this = cx.entity().downgrade();
+        let picker = Button::new(SharedString::from(format!("{id}-picker")))
+            .ghost()
+            .xsmall()
+            .icon(IconName::ChevronsUpDown)
+            .dropdown_menu(move |menu, _, _| {
+                let mut menu = menu.scrollable(true).max_h(px(320.));
+                let pick = |value: Option<String>| {
+                    let this = this.clone();
+                    move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                        let value = value.clone();
+                        let _ = this.update(cx, |this, cx| set(this, value, window, cx));
+                    }
+                };
+                menu = menu.item(
+                    PopupMenuItem::new(none_label)
+                        .checked(current.is_none())
+                        .on_click(pick(None)),
+                );
+                if !options.is_empty() {
+                    menu = menu.separator();
+                }
+                for option in &options {
+                    menu = menu.item(
+                        PopupMenuItem::new(option.clone())
+                            .checked(current.as_ref() == Some(option))
+                            .on_click(pick(Some(option.clone()))),
+                    );
+                }
+                menu
+            });
+        div()
+            .w(px(150.))
+            .child(
+                Input::new(input)
+                    .xsmall()
+                    .appearance(false)
+                    .prefix(Icon::new(icon).xsmall().text_color(theme.muted_foreground))
+                    .suffix(picker),
+            )
+            .into_any_element()
+    }
+
     /// A small segmented control.
     fn segmented<T: Copy + PartialEq + 'static>(
         &self,
@@ -1993,6 +2876,60 @@ impl ZettelApp {
                         .appearance(false)
                         .prefix(Icon::new(IconName::Tag).xsmall().text_color(theme.muted_foreground)),
                 ),
+            );
+
+        let project = h_flex()
+            .gap_2()
+            .flex_wrap()
+            .child(self.render_project_field(
+                "project",
+                &self.project_input,
+                IconName::Folder,
+                "No project",
+                card.project.clone(),
+                self.stats.projects.keys().cloned().collect(),
+                Self::set_project,
+                cx,
+            ))
+            .when(card.project.is_some(), |s| {
+                let components = card
+                    .project
+                    .as_ref()
+                    .and_then(|p| self.stats.projects.get(p))
+                    .map(|p| p.components.keys().cloned().collect())
+                    .unwrap_or_default();
+                s.child(Icon::new(IconName::ChevronRight).xsmall().text_color(theme.muted_foreground))
+                    .child(self.render_project_field(
+                        "component",
+                        &self.component_input,
+                        IconName::Component,
+                        "No component",
+                        card.component.clone(),
+                        components,
+                        Self::set_component,
+                        cx,
+                    ))
+            })
+            .when_some(
+                card.project.as_ref().zip(card.component.as_ref()),
+                |s, (project, component)| {
+                    let features = self
+                        .stats
+                        .component(project, component)
+                        .map(|c| c.features.keys().cloned().collect())
+                        .unwrap_or_default();
+                    s.child(Icon::new(IconName::ChevronRight).xsmall().text_color(theme.muted_foreground))
+                        .child(self.render_project_field(
+                            "feature",
+                            &self.feature_input,
+                            IconName::Flag,
+                            "No feature",
+                            card.feature.clone(),
+                            features,
+                            Self::set_feature,
+                            cx,
+                        ))
+                },
             );
 
         let body: AnyElement = match card.kind {
@@ -2214,6 +3151,7 @@ impl ZettelApp {
                                     )),
                             ),
                     )
+                    .child(project)
                     .child(tags)
                     .child(div().h_px().w_full().bg(theme.border))
                     .children(body_toolbar)
@@ -2886,8 +3824,10 @@ impl Render for ZettelApp {
             .bg(theme.background)
             .text_color(theme.foreground)
             .font_family(theme.font_family.clone())
+            .relative()
             .child(self.render_title_bar(cx))
             .child(content)
+            .children(self.vault.is_some().then(|| self.render_query_dialog(cx)).flatten())
             .when_some(frame, |s, frame| {
                 // Painted last, so this marks the end of the frame's work.
                 s.child(

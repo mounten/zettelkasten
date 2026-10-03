@@ -25,6 +25,11 @@ gpui_kit::assets::icon_assets!(
         Vault,
         FolderPlus,
         LogOut,
+        Component,
+        Bookmark,
+        Pencil,
+        Flag,
+        Funnel,
     ]
 );
 
