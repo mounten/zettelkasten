@@ -9102,6 +9102,7 @@ dependencies = [
  "dirs 6.0.0",
  "embed-resource",
  "gpui-kit",
+ "image",
  "resvg 0.45.1",
  "serde",
  "serde_json",

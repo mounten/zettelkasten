@@ -30,6 +30,8 @@ uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
 serde_yaml = "0.9"
+# Already used by gpui; re-encodes pasted bitmaps as PNG.
+image = { version = "0.25", default-features = false, features = ["png", "bmp", "tiff", "ico", "pnm"] }
 
 [profile.release]
 lto = "thin"

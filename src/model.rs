@@ -141,12 +141,13 @@ impl Card {
             return self.title.trim().to_string();
         }
         let first = match self.kind {
-            CardKind::Todo => self.items.first().map(|i| i.text.as_str()),
+            CardKind::Todo => self.items.first().map(|i| i.text.clone()),
             CardKind::Note => self
                 .body
                 .lines()
+                .map(plain_line)
                 .find(|l| !l.trim().is_empty())
-                .map(|l| l.trim().trim_start_matches('#').trim_start()),
+                .map(|l| l.trim().trim_start_matches('#').trim_start().to_string()),
             // The code itself is shown on the card, don't repeat it as title.
             CardKind::Snippet => None,
         };
@@ -538,6 +539,118 @@ pub fn fenced(code: &str, language: &str) -> String {
 {fence}")
 }
 
+/// Whether a file name or link points to an image the app can show inline.
+pub fn is_image(path: &str) -> bool {
+    let ext = path.rsplit_once('.').map(|(_, ext)| ext.to_lowercase());
+    matches!(
+        ext.as_deref(),
+        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg")
+    )
+}
+
+/// Markdown that embeds an attachment: images inline, other files as a link.
+pub fn embed_markdown(link: &str) -> String {
+    let name = link.rsplit('/').next().unwrap_or(link);
+    if is_image(link) {
+        format!("![{name}]({link})")
+    } else {
+        format!("[{name}]({link})")
+    }
+}
+
+/// An inline Markdown link or image, `[label](target)` or `![label](target)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MdLink {
+    pub image: bool,
+    pub label: String,
+    pub target: String,
+    /// Byte range of the whole link in the text.
+    pub range: std::ops::Range<usize>,
+}
+
+impl MdLink {
+    /// Points to a file rather than a web page or an anchor.
+    pub fn is_local(&self) -> bool {
+        let t = &self.target;
+        !(t.contains("://") || t.starts_with('#') || t.starts_with("mailto:") || t.starts_with("data:"))
+    }
+
+    /// The file name the link points to.
+    pub fn file_name(&self) -> &str {
+        self.target.rsplit(['/', '\\']).next().unwrap_or(&self.target)
+    }
+}
+
+/// The inline links and images in Markdown text, in order.
+pub fn md_links(text: &str) -> Vec<MdLink> {
+    let mut links = Vec::new();
+    let mut pos = 0;
+    while let Some(open) = text[pos..].find('[').map(|i| pos + i) {
+        let image = text[..open].ends_with('!');
+        let after = &text[open + 1..];
+        let parsed = after.find("](").and_then(|close| {
+            let label = &after[..close];
+            let target_start = open + 1 + close + 2;
+            let end = text[target_start..].find(')')? + target_start;
+            // A `[` in the label starts the next candidate.
+            (!label.contains(['[', '\n'])).then_some((label, target_start, end))
+        });
+        let Some((label, target_start, end)) = parsed else {
+            pos = open + 1;
+            continue;
+        };
+        let target = text[target_start..end].trim();
+        // Drop an optional `"title"` and `<…>` around the destination.
+        let target = target.split(" \"").next().unwrap_or(target).trim_matches(['<', '>']);
+        if !target.is_empty() && !target.contains('\n') {
+            links.push(MdLink {
+                image,
+                label: label.to_string(),
+                target: target.to_string(),
+                range: if image { open - 1 } else { open }..end + 1,
+            });
+        }
+        pos = end + 1;
+    }
+    links
+}
+
+/// The text with all images removed, e.g. for previews that show them apart.
+pub fn strip_images(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    for link in md_links(text).into_iter().filter(|l| l.image) {
+        out.push_str(&text[last..link.range.start]);
+        last = link.range.end;
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
+/// A line as plain text: images dropped, links reduced to their label.
+fn plain_line(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut last = 0;
+    for link in md_links(line) {
+        out.push_str(&line[last..link.range.start]);
+        if !link.image {
+            out.push_str(&link.label);
+        }
+        last = link.range.end;
+    }
+    out.push_str(&line[last..]);
+    out
+}
+
+/// File size for display, e.g. "12 KB".
+pub fn human_size(bytes: u64) -> String {
+    match bytes {
+        0..1024 => format!("{bytes} B"),
+        1024..1_048_576 => format!("{} KB", bytes / 1024),
+        _ => format!("{:.1} MB", bytes as f64 / 1_048_576.),
+    }
+}
+
 /// Section label for the day a card was created.
 pub fn day_label(date: chrono::NaiveDate) -> String {
     let today = Local::now().date_naive();
@@ -631,6 +744,35 @@ body".into();
         card.set_project(None);
         card.set_component(Some("sidebar".into()));
         assert_eq!(card.component, None);
+    }
+
+    #[test]
+    fn embeds() {
+        assert_eq!(embed_markdown("attachments/a.PNG"), "![a.PNG](attachments/a.PNG)");
+        assert_eq!(embed_markdown("attachments/doc.pdf"), "[doc.pdf](attachments/doc.pdf)");
+        let text = "See [doc.pdf](attachments/doc.pdf) and ![pic](attachments/p.png),\n\
+                    [site](https://x.org), [[wiki]] and [b](<c.zip> \"title\").";
+        let links = md_links(text);
+        let summary: Vec<(bool, &str, &str, bool)> = links
+            .iter()
+            .map(|l| (l.image, l.label.as_str(), l.target.as_str(), l.is_local()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (false, "doc.pdf", "attachments/doc.pdf", true),
+                (true, "pic", "attachments/p.png", true),
+                (false, "site", "https://x.org", false),
+                (false, "b", "c.zip", true),
+            ]
+        );
+        assert_eq!(&text[links[1].range.clone()], "![pic](attachments/p.png)");
+        assert_eq!(links[0].file_name(), "doc.pdf");
+        assert_eq!(strip_images("a ![x](y.png) b"), "a  b");
+
+        let mut card = Card::new(CardKind::Note);
+        card.body = "![shot](attachments/s.png)\n[report.pdf](attachments/report.pdf) to read".into();
+        assert_eq!(card.display_title(), "report.pdf to read");
     }
 
     #[test]

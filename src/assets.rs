@@ -30,6 +30,9 @@ gpui_kit::assets::icon_assets!(
         Pencil,
         Flag,
         Funnel,
+        Paperclip,
+        Image,
+        ImageOff,
     ]
 );
 

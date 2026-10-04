@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -8,11 +8,11 @@ use chrono::{Local, NaiveDate};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
     ActiveTheme as _, Colorize as _, Icon, InteractiveElementExt as _, Sizable as _,
-    StyledExt as _, TitleBar,
+    StyledExt as _, Theme, ThemeMode, TitleBar,
     WindowExt as _,
     button::{Button, ButtonVariants as _},
     h_flex,
-    input::{Editor, EditorState, Input, InputEvent, InputState},
+    input::{Editor, EditorState, Input, InputEvent, InputState, Paste},
     kbd::Kbd,
     menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem},
     notification::Notification,
@@ -25,12 +25,13 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::model::{
-    Card, CardColor, CardKind, LANGUAGES, SavedQuery, TodoItem, dash_spaces, day_label,
-    detect_language, fenced, language_label, normalize_tag, relative_time, truncate,
+    Card, CardColor, CardKind, LANGUAGES, MdLink, SavedQuery, TodoItem, dash_spaces, day_label,
+    detect_language, embed_markdown, fenced, human_size, is_image, language_label, md_links,
+    normalize_tag, relative_time, strip_images, truncate,
 };
 use crate::store::{
-    AppConfig, LoadedVault, Vault, VaultState, legacy_cards_path, load_legacy_cards,
-    retire_legacy_cards, vault_name,
+    AppConfig, LoadedVault, ThemePreference, Vault, VaultState, legacy_cards_path, link_path,
+    load_legacy_cards, retire_legacy_cards, vault_name,
 };
 
 const CONTEXT: &str = "Zettelkasten";
@@ -487,7 +488,13 @@ impl ZettelApp {
                     }
                 }
             }),
+            cx.observe_window_appearance(window, |this, window, cx| {
+                if this.config.theme == ThemePreference::System {
+                    apply_theme(ThemePreference::System, window, cx);
+                }
+            }),
         ];
+        apply_theme(config.theme, window, cx);
 
         let mut this = Self {
             config,
@@ -1004,6 +1011,161 @@ impl ZettelApp {
         cx.notify();
     }
 
+    fn set_theme(&mut self, theme: ThemePreference, window: &mut Window, cx: &mut Context<Self>) {
+        self.config.theme = theme;
+        self.save_settings();
+        apply_theme(theme, window, cx);
+    }
+
+    // ----- attachments ------------------------------------------------------
+
+    /// Whether files can be embedded in the open card; only notes take them.
+    fn can_attach(&self) -> bool {
+        self.selected_card().is_some_and(|c| c.kind == CardKind::Note)
+    }
+
+    /// Copy files into the vault; returns the Markdown that embeds them.
+    fn import_files(&mut self, paths: &[PathBuf], window: &mut Window, cx: &mut Context<Self>) -> Option<String> {
+        let vault = self.vault.as_ref()?;
+        let mut embeds = Vec::new();
+        let mut errors = Vec::new();
+        for path in paths.iter().filter(|p| p.is_file()) {
+            match vault.import_attachment(path) {
+                Ok(link) => embeds.push(embed_markdown(&link)),
+                Err(err) => errors.push(format!("{}: {err}", path.display())),
+            }
+        }
+        if let Some(first) = errors.first() {
+            self.report(format!("Attaching failed: {first}"), Some(window), cx);
+        }
+        // Paragraphs of their own, or images shrink to the height of a line.
+        (!embeds.is_empty()).then(|| embeds.join("\n\n"))
+    }
+
+    /// Embed files in the open note.
+    fn attach_files(&mut self, paths: &[PathBuf], window: &mut Window, cx: &mut Context<Self>) {
+        if self.can_attach()
+            && let Some(markdown) = self.import_files(paths, window, cx)
+        {
+            self.insert_embeds(markdown, window, cx);
+        }
+    }
+
+    /// Add Markdown to the open note: at the cursor while writing, at the
+    /// end in preview, where there is no cursor.
+    fn insert_embeds(&mut self, markdown: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(card) = self.selected_card().filter(|c| c.kind == CardKind::Note) else {
+            return;
+        };
+        let body = if self.preview {
+            let body = card.body.trim_end();
+            let body = if body.is_empty() { markdown } else { format!("{body}\n\n{markdown}") };
+            self.body.update(cx, |s, cx| s.set_value(body.clone(), window, cx));
+            body
+        } else {
+            self.body.update(cx, |s, cx| {
+                // Embeds go in a paragraph of their own: blank lines around them.
+                let value = s.value();
+                let cursor = s.cursor();
+                let before = value.get(..cursor).unwrap_or_default().trim_end_matches(' ');
+                let after = value.get(cursor..).unwrap_or_default();
+                let lead = match before {
+                    "" => "",
+                    b if b.ends_with("\n\n") => "",
+                    b if b.ends_with('\n') => "\n",
+                    _ => "\n\n",
+                };
+                let trail = if after.starts_with("\n\n") { "" } else if after.starts_with('\n') { "\n" } else { "\n\n" };
+                s.insert(format!("{lead}{markdown}{trail}"), window, cx);
+                s.focus(window, cx);
+            });
+            self.body.read(cx).value().to_string()
+        };
+        self.update_selected(cx, |card| card.body = body);
+    }
+
+    /// Choose files to embed in the open note.
+    fn prompt_attach(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Attach".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = paths.await {
+                let _ = this.update_in(cx, |this, window, cx| this.attach_files(&paths, window, cx));
+            }
+        })
+        .detach();
+    }
+
+    /// Files dropped on the card list go into the open note, or a new one.
+    fn drop_files(&mut self, paths: &ExternalPaths, window: &mut Window, cx: &mut Context<Self>) {
+        if self.can_attach() {
+            self.attach_files(paths.paths(), window, cx);
+        } else if let Some(markdown) = self.import_files(paths.paths(), window, cx) {
+            self.create(CardKind::Note, Some(markdown), window, cx);
+            self.preview = true;
+        }
+    }
+
+    /// Pasting files or an image into a note attaches them; text pastes as usual.
+    ///
+    /// Runs in the capture phase, before the editor's own paste: anything it
+    /// handles must stop propagation.
+    fn on_paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(item) = cx.read_from_clipboard().filter(|_| self.can_attach()) else {
+            return;
+        };
+        let mut paths = Vec::new();
+        let mut image = None;
+        let mut text = false;
+        for entry in item.entries() {
+            match entry {
+                ClipboardEntry::ExternalPaths(p) => paths.extend(p.paths().iter().cloned()),
+                ClipboardEntry::Image(img) => image = image.or(Some(img)),
+                ClipboardEntry::String(_) => text = true,
+            }
+        }
+        if !paths.is_empty() {
+            // Copied files also come with their paths as text; skip that.
+            cx.stop_propagation();
+            self.attach_files(&paths, window, cx);
+            return;
+        }
+        // Apps often put a picture of copied text next to it; text wins.
+        let (Some(image), false) = (image, text) else {
+            return;
+        };
+        cx.stop_propagation();
+        let (ext, bytes) = match image.format {
+            ImageFormat::Png => ("png", image.bytes.clone()),
+            ImageFormat::Jpeg => ("jpg", image.bytes.clone()),
+            ImageFormat::Webp => ("webp", image.bytes.clone()),
+            ImageFormat::Gif => ("gif", image.bytes.clone()),
+            ImageFormat::Svg => ("svg", image.bytes.clone()),
+            // Windows hands out screenshots as uncompressed bitmaps.
+            ImageFormat::Bmp | ImageFormat::Tiff | ImageFormat::Ico | ImageFormat::Pnm => {
+                match to_png(&image.bytes) {
+                    Ok(png) => ("png", png),
+                    Err(err) => {
+                        self.report(format!("Reading the image failed: {err}"), Some(window), cx);
+                        return;
+                    }
+                }
+            }
+        };
+        let name = format!("pasted-{}.{ext}", Local::now().format("%Y%m%d-%H%M%S"));
+        let Some(vault) = &self.vault else {
+            return;
+        };
+        match vault.save_attachment(&name, &bytes) {
+            Ok(link) => self.insert_embeds(embed_markdown(&link), window, cx),
+            Err(err) => self.report(format!("Saving the image failed: {err}"), Some(window), cx),
+        }
+    }
+
     // ----- projects ---------------------------------------------------------
 
     fn set_project(&mut self, project: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
@@ -1435,7 +1597,200 @@ fn card_markdown_style() -> TextViewStyle {
         })
 }
 
+/// Switch to the light or dark theme the preference asks for.
+fn apply_theme(theme: ThemePreference, window: &mut Window, cx: &mut App) {
+    match theme {
+        ThemePreference::Light => Theme::change(ThemeMode::Light, Some(window), cx),
+        ThemePreference::Dark => Theme::change(ThemeMode::Dark, Some(window), cx),
+        ThemePreference::System => Theme::sync_system_appearance(Some(window), cx),
+    }
+}
+
+fn file_icon(name: &str) -> IconName {
+    let name = name.to_lowercase();
+    if is_image(&name) {
+        IconName::Image
+    } else if [".pdf", ".txt", ".md", ".doc", ".docx", ".rtf"].iter().any(|ext| name.ends_with(ext)) {
+        IconName::FileText
+    } else {
+        IconName::File
+    }
+}
+
+fn to_png(bytes: &[u8]) -> image::ImageResult<Vec<u8>> {
+    let mut png = Vec::new();
+    image::load_from_memory(bytes)?
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)?;
+    Ok(png)
+}
+
+/// Where an image in a card loads from: a file in the vault or a web URL.
+fn image_source(root: &Path, target: &str) -> Option<ImageSource> {
+    if target.starts_with("http://") || target.starts_with("https://") {
+        return Some(SharedUri::from(target.to_string()).into());
+    }
+    link_path(root, target).map(ImageSource::from)
+}
+
+/// Open a link in a card: files with their app, web links in the browser.
+fn open_link(root: &Path, link: &str, window: &mut Window, cx: &mut App) {
+    match link_path(root, link) {
+        Some(path) if path.exists() => cx.open_with_system(&path),
+        Some(path) => window.push_notification(
+            Notification::error(format!("{} not found", path.display())),
+            cx,
+        ),
+        None if link.starts_with('#') => {}
+        None => cx.open_url(link),
+    }
+}
+
+/// Markdown whose images and file links resolve inside the vault.
+fn vault_markdown(
+    id: impl Into<ElementId>,
+    text: impl Into<SharedString>,
+    root: &Path,
+) -> gpui_kit::base::TextView {
+    let images = root.to_path_buf();
+    let links = root.to_path_buf();
+    gpui_kit::base::TextView::markdown(id, text)
+        .image_source(move |uri| {
+            let uri = uri.to_string();
+            image_source(&images, &uri).unwrap_or_else(|| SharedUri::from(uri).into())
+        })
+        .on_link_click(move |url, _, window, cx| open_link(&links, url, window, cx))
+}
+
 impl ZettelApp {
+    /// Image previews for a card in the list.
+    fn render_thumbnails(&self, card: &Card, cx: &mut Context<Self>) -> Option<AnyElement> {
+        const SHOWN: usize = 3;
+        let root = self.vault.as_ref()?.root();
+        let sources: Vec<ImageSource> = md_links(&card.body)
+            .iter()
+            .filter(|l| l.image)
+            .filter_map(|l| image_source(root, &l.target))
+            .collect();
+        if sources.is_empty() {
+            return None;
+        }
+        let theme = cx.theme().clone();
+        let more = sources.len().saturating_sub(SHOWN);
+        // A single image is shown whole, several are cropped into tiles.
+        let single = sources.len() == 1;
+        let height = px(if single { 200. } else { 120. });
+        let muted = theme.muted_foreground;
+        Some(
+            h_flex()
+                .gap_2()
+                .children(sources.into_iter().take(SHOWN).enumerate().map(|(ix, source)| {
+                    div()
+                        .relative()
+                        .flex_1()
+                        .min_w_0()
+                        .h(height)
+                        .rounded(theme.radius)
+                        .bg(theme.muted)
+                        .overflow_hidden()
+                        .child(
+                            // Out of the flow, so the image's own size can't stretch the box.
+                            img(source)
+                                .absolute()
+                                .inset_0()
+                                .size_full()
+                                .rounded(theme.radius)
+                                .object_fit(if single { ObjectFit::Contain } else { ObjectFit::Cover })
+                                .with_fallback(move || {
+                                    div()
+                                        .size_full()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(Icon::new(IconName::ImageOff).text_color(muted))
+                                        .into_any_element()
+                                }),
+                        )
+                        .when(more > 0 && ix == SHOWN - 1, |s| {
+                            s.child(
+                                div()
+                                    .absolute()
+                                    .inset_0()
+                                    .rounded(theme.radius)
+                                    .bg(gpui_kit::black().opacity(0.45))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_color(gpui_kit::white())
+                                    .font_semibold()
+                                    .child(format!("+{more}")),
+                            )
+                        })
+                }))
+                .into_any_element(),
+        )
+    }
+
+    /// Chips for the files a note links to; a click opens the file.
+    /// `detailed` adds the file size, which reads the disk.
+    fn render_file_chips(&self, card: &Card, detailed: bool, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let root = self.vault.as_ref()?.root().to_path_buf();
+        let mut files: Vec<MdLink> = md_links(&card.body)
+            .into_iter()
+            .filter(|l| !l.image && l.is_local())
+            .collect();
+        files.dedup_by(|a, b| a.target == b.target);
+        if files.is_empty() {
+            return None;
+        }
+        let theme = cx.theme().clone();
+        Some(
+            h_flex()
+                .gap_1p5()
+                .flex_wrap()
+                .children(files.into_iter().enumerate().map(|(ix, link)| {
+                    let size = detailed
+                        .then(|| link_path(&root, &link.target))
+                        .flatten()
+                        .map(|path| std::fs::metadata(path).map(|m| human_size(m.len())));
+                    let missing = matches!(size, Some(Err(_)));
+                    let root = root.clone();
+                    let target = link.target.clone();
+                    h_flex()
+                        .id(SharedString::from(format!("file-{}-{ix}", card.id)))
+                        .gap_1p5()
+                        .max_w(px(280.))
+                        .px_2()
+                        .py_1()
+                        .rounded(theme.radius)
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.background.opacity(0.6))
+                        .text_xs()
+                        .cursor_pointer()
+                        .hover(|s| s.border_color(theme.ring).bg(theme.secondary))
+                        .when(missing, |s| s.opacity(0.55))
+                        .child(Icon::new(file_icon(&link.target)).xsmall().text_color(theme.muted_foreground))
+                        .child(div().min_w_0().truncate().child(link.file_name().to_string()))
+                        .children(size.map(|size| {
+                            div()
+                                .flex_none()
+                                .text_color(theme.muted_foreground)
+                                .child(size.unwrap_or_else(|_| "missing".into()))
+                        }))
+                        .tooltip(|window, cx| {
+                            gpui_kit::component::tooltip::Tooltip::new("Open").build(window, cx)
+                        })
+                        // Opening the file should not open the card too.
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(move |_, window, cx| {
+                            cx.stop_propagation();
+                            open_link(&root, &target, window, cx);
+                        })
+                }))
+                .into_any_element(),
+        )
+    }
+
     fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let count = |f: &Filter| self.stats.count(f);
@@ -2293,15 +2648,18 @@ impl ZettelApp {
 
         let content: Option<AnyElement> = match card.kind {
             CardKind::Note => {
+                // Images show as thumbnails below the text.
+                let body = strip_images(&card.body);
                 let text = if card.has_title() {
-                    card.body.trim().to_string()
+                    body.trim().to_string()
                 } else {
                     // The first line already serves as title.
-                    let mut lines = card.body.trim().lines();
+                    let mut lines = body.trim().lines();
                     lines.next();
                     lines.collect::<Vec<_>>().join("\n").trim().to_string()
                 };
-                (!text.is_empty()).then(|| {
+                let root = self.vault.as_ref().map(|v| v.root().to_path_buf()).unwrap_or_default();
+                let text = (!text.is_empty()).then(|| {
                     div()
                         .text_sm()
                         .text_color(theme.foreground.opacity(0.8))
@@ -2309,8 +2667,18 @@ impl ZettelApp {
                             TextView::markdown(SharedString::from(format!("md-{}", card.id)), text)
                                 .style(card_markdown_style())
                                 .selectable(false)
-                                .max_lines(12),
+                                .max_lines(12)
+                                .on_link_click(move |url, _, window, cx| open_link(&root, url, window, cx)),
                         )
+                });
+                let thumbnails = self.render_thumbnails(card, cx);
+                let files = self.render_file_chips(card, false, cx);
+                (text.is_some() || thumbnails.is_some() || files.is_some()).then(|| {
+                    v_flex()
+                        .gap_3()
+                        .children(text)
+                        .children(thumbnails)
+                        .children(files)
                         .into_any_element()
                 })
             }
@@ -2986,7 +3354,14 @@ impl ZettelApp {
                 .px_1()
                 .on_double_click(cx.listener(|this, _, window, cx| this.set_preview(false, window, cx)))
                 .overflow_y_scrollbar()
-                .child(TextView::markdown("editor-preview", card.body.clone()).selectable(true))
+                .child(match &self.vault {
+                    Some(vault) => vault_markdown("editor-preview", card.body.clone(), vault.root())
+                        .selectable(true)
+                        .into_any_element(),
+                    None => TextView::markdown("editor-preview", card.body.clone())
+                        .selectable(true)
+                        .into_any_element(),
+                })
                 .into_any_element(),
             CardKind::Note | CardKind::Snippet => v_flex()
                 .flex_1()
@@ -3003,16 +3378,33 @@ impl ZettelApp {
                         div()
                             .text_xs()
                             .text_color(theme.muted_foreground)
-                            .child(if self.preview { "Double-click to edit" } else { "Markdown" }),
+                            .child(if self.preview {
+                                "Double-click to edit"
+                            } else {
+                                "Markdown · drop or paste files to attach"
+                            }),
                     )
-                    .child(self.segmented(
-                        "mode",
-                        vec![(false, Some(IconName::NotebookPen), "Write"), (true, Some(IconName::BookOpen), "Preview")],
-                        self.preview,
-                        accent,
-                        cx,
-                        |this, preview, window, cx| this.set_preview(preview, window, cx),
-                    ))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Button::new("attach")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(IconName::Paperclip)
+                                    .label("Attach")
+                                    .tooltip("Embed images or files")
+                                    .on_click(cx.listener(|this, _, window, cx| this.prompt_attach(window, cx))),
+                            )
+                            .child(self.segmented(
+                                "mode",
+                                vec![(false, Some(IconName::NotebookPen), "Write"), (true, Some(IconName::BookOpen), "Preview")],
+                                self.preview,
+                                accent,
+                                cx,
+                                |this, preview, window, cx| this.set_preview(preview, window, cx),
+                            )),
+                    )
                     .into_any_element(),
             ),
             CardKind::Snippet => Some(
@@ -3051,6 +3443,14 @@ impl ZettelApp {
             .border_1()
             .border_color(theme.border)
             .bg(theme.background.mix(theme.secondary, 0.35))
+            .capture_action(cx.listener(Self::on_paste))
+            .when(card.kind == CardKind::Note, |s| {
+                // Other kinds let the drop through to the list, which makes a new note.
+                s.drag_over::<ExternalPaths>(move |s, _, _, _| s.border_color(accent))
+                    .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                        this.attach_files(paths.paths(), window, cx)
+                    }))
+            })
             .child(
                 // Accent line, kept clear of the rounded corners.
                 div()
@@ -3155,7 +3555,12 @@ impl ZettelApp {
                     .child(tags)
                     .child(div().h_px().w_full().bg(theme.border))
                     .children(body_toolbar)
-                    .child(body),
+                    .child(body)
+                    .children(
+                        (card.kind == CardKind::Note)
+                            .then(|| self.render_file_chips(card, true, cx))
+                            .flatten(),
+                    ),
             )
             .child(
                 h_flex()
@@ -3482,6 +3887,33 @@ impl ZettelApp {
                             .child(self.render_vault_menu(cx))
                     }),
             )
+            .child(div().pr_2().child(self.render_settings_menu(cx)))
+            .into_any_element()
+    }
+
+    /// App settings in the title bar.
+    fn render_settings_menu(&self, cx: &mut Context<Self>) -> AnyElement {
+        let this = cx.entity().downgrade();
+        let current = self.config.theme;
+        Button::new("settings")
+            .ghost()
+            .xsmall()
+            .icon(IconName::Settings)
+            .tooltip("Settings")
+            .dropdown_menu(move |menu, _, _| {
+                let mut menu = menu.label("Theme");
+                for theme in ThemePreference::ALL {
+                    let this = this.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(theme.label())
+                            .checked(current == theme)
+                            .on_click(move |_, window, cx| {
+                                let _ = this.update(cx, |this, cx| this.set_theme(theme, window, cx));
+                            }),
+                    );
+                }
+                menu
+            })
             .into_any_element()
     }
 
@@ -3875,6 +4307,8 @@ impl ZettelApp {
                             .flex_1()
                             .min_w_0()
                             .h_full()
+                            .drag_over::<ExternalPaths>(|s, _, _, cx| s.bg(cx.theme().ring.opacity(0.06)))
+                            .on_drop(cx.listener(Self::drop_files))
                             .child(self.render_header(visible, compact, cx))
                             .child(self.render_list(cx))
                             .children(self.render_undo(cx))

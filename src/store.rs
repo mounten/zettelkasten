@@ -16,9 +16,34 @@ use crate::model::{Card, CardColor, CardKind, SavedQuery, TodoItem, fenced};
 
 /// Hidden folder inside a vault for app state and the trash.
 const META_DIR: &str = ".zettelkasten";
+/// Folder inside a vault for embedded images and files.
+const ATTACHMENTS_DIR: &str = "attachments";
 const MAX_RECENT: usize = 8;
 
 // ----- app config ---------------------------------------------------------------
+
+/// Color theme; `System` follows the OS light/dark setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemePreference {
+    Light,
+    #[default]
+    Dark,
+    System,
+}
+
+impl ThemePreference {
+    pub const ALL: [ThemePreference; 3] =
+        [ThemePreference::Light, ThemePreference::Dark, ThemePreference::System];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ThemePreference::Light => "Light",
+            ThemePreference::Dark => "Dark",
+            ThemePreference::System => "System",
+        }
+    }
+}
 
 /// App-wide preferences, stored in `%APPDATA%\Zettelkasten\config.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,6 +55,7 @@ pub struct AppConfig {
     pub dock_width: f32,
     /// Collapsed sidebar sections, by label.
     pub collapsed_sections: Vec<String>,
+    pub theme: ThemePreference,
 }
 
 impl Default for AppConfig {
@@ -40,6 +66,7 @@ impl Default for AppConfig {
             sidebar_width: 232.,
             dock_width: 280.,
             collapsed_sections: Vec::new(),
+            theme: ThemePreference::default(),
         }
     }
 }
@@ -228,6 +255,60 @@ impl Vault {
         fs::rename(&path, trash.join(file_name(&path)))
     }
 
+    /// Copy a file into the attachment folder and return its vault-relative
+    /// path for a Markdown link. Files already inside the vault are linked
+    /// where they are.
+    pub fn import_attachment(&self, source: &Path) -> io::Result<String> {
+        if let Some(rel) = self.relative_path(source) {
+            return Ok(rel);
+        }
+        let name = file_name(source);
+        let target = self.new_attachment_path(&name)?;
+        fs::copy(source, &target)?;
+        Ok(self.relative_path(&target).unwrap_or_default())
+    }
+
+    /// Store raw bytes, e.g. a pasted image, as an attachment.
+    pub fn save_attachment(&self, name: &str, bytes: &[u8]) -> io::Result<String> {
+        let target = self.new_attachment_path(name)?;
+        fs::write(&target, bytes)?;
+        Ok(self.relative_path(&target).unwrap_or_default())
+    }
+
+    /// A free path in the attachment folder for a file called `name`.
+    fn new_attachment_path(&self, name: &str) -> io::Result<PathBuf> {
+        let dir = self.root.join(ATTACHMENTS_DIR);
+        fs::create_dir_all(&dir)?;
+        let (stem, ext) = link_safe_name(name);
+        let mut path = dir.join(format!("{stem}{ext}"));
+        let mut n = 1;
+        while path.exists() {
+            n += 1;
+            path = dir.join(format!("{stem}-{n}{ext}"));
+        }
+        Ok(path)
+    }
+
+    /// `path` relative to the vault with forward slashes, if it is inside it
+    /// and can be written into a Markdown link as is.
+    fn relative_path(&self, path: &Path) -> Option<String> {
+        let root = self.root.canonicalize().ok()?;
+        let path = path.canonicalize().ok()?;
+        let parts: Vec<String> = path
+            .strip_prefix(&root)
+            .ok()?
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        parts
+            .iter()
+            .all(|p| {
+                let (stem, ext) = link_safe_name(p);
+                format!("{stem}{ext}") == *p
+            })
+            .then(|| parts.join("/"))
+    }
+
     pub fn load_state(&self) -> VaultState {
         fs::read_to_string(self.root.join(META_DIR).join("state.json"))
             .ok()
@@ -262,6 +343,66 @@ pub fn vault_name(path: &Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string())
+}
+
+/// Split a file name into a stem and `.ext` that need no escaping in a
+/// Markdown link: anything but letters, digits, `-` and `_` becomes a dash.
+fn link_safe_name(name: &str) -> (String, String) {
+    let clean = |s: &str| {
+        let mut out = String::with_capacity(s.len());
+        for ch in s.chars() {
+            if ch.is_alphanumeric() || ch == '_' {
+                out.push(ch);
+            } else if !out.ends_with('-') {
+                out.push('-');
+            }
+        }
+        out.trim_matches('-').to_string()
+    };
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => (clean(stem), clean(ext).to_lowercase()),
+        _ => (clean(name), String::new()),
+    };
+    let stem = if stem.is_empty() { "file".to_string() } else { stem };
+    let ext = if ext.is_empty() { ext } else { format!(".{ext}") };
+    (stem, ext)
+}
+
+/// The local file a Markdown link points to: a path relative to the vault
+/// root or an absolute one; `None` for URLs. Does not touch the disk.
+pub fn link_path(root: &Path, link: &str) -> Option<PathBuf> {
+    let link = link.trim().trim_start_matches('<').trim_end_matches('>');
+    let link = link.strip_prefix("file:///").unwrap_or(link);
+    // `C:/...` has a colon too, but no `//` after it.
+    if link.is_empty()
+        || link.starts_with('#')
+        || link.contains("://")
+        || link.starts_with("data:")
+        || link.starts_with("mailto:")
+    {
+        return None;
+    }
+    let link = percent_decode(link);
+    let path = Path::new(&link);
+    Some(if path.is_absolute() { path.to_path_buf() } else { root.join(path) })
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && let Some(byte) = s.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(h, 16).ok())
+        {
+            out.push(byte);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn file_name(path: &Path) -> String {
@@ -528,6 +669,36 @@ mod tests {
         loaded.vault.delete_card(&card.id).unwrap();
         assert_eq!(Vault::open(&dir).unwrap().cards.len(), 1);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn attachments() {
+        let dir = std::env::temp_dir().join(format!("zk-test-{}", uuid::Uuid::new_v4()));
+        let outside = std::env::temp_dir().join(format!("zk-src-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&outside).unwrap();
+        let source = outside.join("My Report (final).PDF");
+        fs::write(&source, b"%PDF").unwrap();
+
+        let vault = Vault::open(&dir).unwrap().vault;
+        let first = vault.import_attachment(&source).unwrap();
+        assert_eq!(first, "attachments/My-Report-final.pdf");
+        assert_eq!(vault.import_attachment(&source).unwrap(), "attachments/My-Report-final-2.pdf");
+        // Already in the vault: linked, not copied again.
+        assert_eq!(vault.import_attachment(&dir.join(&first)).unwrap(), first);
+        assert_eq!(
+            vault.save_attachment("pasted image.png", b"png").unwrap(),
+            "attachments/pasted-image.png"
+        );
+        assert!(Vault::open(&dir).unwrap().cards.is_empty());
+
+        assert_eq!(link_path(&dir, &first), Some(dir.join(&first)));
+        assert_eq!(link_path(&dir, "attachments/My%2DReport-final.pdf"), Some(dir.join(&first)));
+        assert_eq!(link_path(&dir, "https://example.com/a.png"), None);
+        assert_eq!(link_path(&dir, "#heading"), None);
+        assert_eq!(link_path(&dir, &source.display().to_string()), Some(source.clone()));
+
+        fs::remove_dir_all(dir).unwrap();
+        fs::remove_dir_all(outside).unwrap();
     }
 }
 
