@@ -12,7 +12,7 @@ use std::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Card, CardColor, CardKind, SavedQuery, TodoItem, fenced};
+use crate::model::{Card, CardColor, CardKind, SavedQuery, fenced, parse_task};
 
 /// Hidden folder inside a vault for app state and the trash.
 const META_DIR: &str = ".zettelkasten";
@@ -465,18 +465,7 @@ pub fn card_to_markdown(card: &Card) -> String {
     let body = match card.kind {
         CardKind::Note => card.body.clone(),
         CardKind::Snippet => fenced(&card.body, card.language()),
-        CardKind::Todo => {
-            let mut lines: Vec<String> = card
-                .items
-                .iter()
-                .map(|i| format!("- [{}] {}", if i.done { "x" } else { " " }, i.text))
-                .collect();
-            if !card.body.trim().is_empty() {
-                lines.push(String::new());
-                lines.push(card.body.trim().to_string());
-            }
-            lines.join("\n")
-        }
+        CardKind::Todo => card.todo_markdown(),
     };
     format!("---\n{yaml}---\n\n{body}\n")
 }
@@ -585,23 +574,10 @@ fn unfence(body: &str) -> &str {
     }
 }
 
-fn parse_task(line: &str) -> Option<TodoItem> {
-    let line = line.trim_start();
-    let line = line.strip_prefix("- ").or_else(|| line.strip_prefix("* "))?;
-    for (prefix, done) in [("[ ] ", false), ("[x] ", true), ("[X] ", true)] {
-        if let Some(text) = line.strip_prefix(prefix) {
-            return Some(TodoItem {
-                text: text.to_string(),
-                done,
-            });
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::TodoItem;
 
     fn round_trip(card: &Card) -> Card {
         let text = card_to_markdown(card);
@@ -639,6 +615,11 @@ mod tests {
         let back = round_trip(&card);
         assert_eq!(back.items, card.items);
         assert!(back.body.is_empty());
+
+        card.body = "Weekly **groceries**\n\n- not a task".into();
+        let back = round_trip(&card);
+        assert_eq!(back.items, card.items);
+        assert_eq!(back.body, card.body);
     }
 
     #[test]

@@ -12,7 +12,7 @@ use gpui_kit::component::{
     WindowExt as _,
     button::{Button, ButtonVariants as _},
     h_flex,
-    input::{Editor, EditorState, Input, InputEvent, InputState, Paste},
+    input::{Editor, EditorState, Enter, Input, InputEvent, InputState, Paste},
     kbd::Kbd,
     menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem},
     notification::Notification,
@@ -26,8 +26,8 @@ use gpui_kit::*;
 
 use crate::model::{
     Card, CardColor, CardKind, LANGUAGES, MdLink, SavedQuery, TodoItem, dash_spaces, day_label,
-    detect_language, embed_markdown, fenced, human_size, is_image, language_label, md_links,
-    normalize_tag, relative_time, strip_images, truncate,
+    detect_language, embed_markdown, fenced, human_size, is_image, language_label, list_enter,
+    md_links, normalize_tag, relative_time, strip_images, truncate,
 };
 use crate::store::{
     AppConfig, LoadedVault, ThemePreference, Vault, VaultState, legacy_cards_path, link_path,
@@ -44,6 +44,7 @@ const MODAL_MAX: (f32, f32) = (860., 820.);
 const MAIN_MIN: f32 = 320.;
 /// How many lines of a snippet the list shows.
 const SNIPPET_PREVIEW_LINES: usize = 14;
+const TODO_DESCRIPTION_HEIGHT: f32 = 120.;
 
 actions!(
     zettelkasten,
@@ -723,7 +724,11 @@ impl ZettelApp {
             s.set_folding(snippet, window, cx);
             s.set_soft_wrap(!snippet, window, cx);
             s.set_placeholder(
-                if snippet { "Paste or write code…" } else { "Start writing… Markdown is supported" },
+                match card.kind {
+                    CardKind::Note => "Start writing… Markdown is supported",
+                    CardKind::Todo => "Add a description…",
+                    CardKind::Snippet => "Paste or write code…",
+                },
                 window,
                 cx,
             );
@@ -952,6 +957,33 @@ impl ZettelApp {
         cx.notify();
     }
 
+    /// Enter in a markdown list starts the next item, or ends the list on an
+    /// empty one; Shift+Enter is a plain newline.
+    ///
+    /// Runs in the capture phase, before the editor's own newline: anything it
+    /// handles must stop propagation.
+    fn on_body_enter(&mut self, action: &Enter, window: &mut Window, cx: &mut Context<Self>) {
+        if action.shift || action.secondary || self.selected_card().is_none_or(|c| c.kind == CardKind::Snippet) {
+            return;
+        }
+        let edit = {
+            let state = self.body.read(cx);
+            let range = state.selected_range();
+            if !range.is_empty() {
+                return;
+            }
+            list_enter(&state.value(), range.end)
+        };
+        let Some(edit) = edit else {
+            return;
+        };
+        cx.stop_propagation();
+        self.body.update(cx, |s, cx| {
+            s.set_selected_range(edit.range, cx);
+            s.replace(edit.text, window, cx);
+        });
+    }
+
     fn paste_snippet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = cx.read_from_clipboard().and_then(|item| item.text());
         match text.filter(|t| !t.trim().is_empty()) {
@@ -966,12 +998,7 @@ impl ZettelApp {
     fn copy_card(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(card) = self.card(id) {
             let text = match card.kind {
-                CardKind::Todo => card
-                    .items
-                    .iter()
-                    .map(|i| format!("- [{}] {}", if i.done { "x" } else { " " }, i.text))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
+                CardKind::Todo => card.todo_markdown(),
                 _ => card.body.clone(),
             };
             cx.write_to_clipboard(ClipboardItem::new_string(text));
@@ -2716,9 +2743,25 @@ impl ZettelApp {
                 // Unfinished tasks first so open work is always visible.
                 let mut items: Vec<(usize, &TodoItem)> = card.items.iter().enumerate().collect();
                 items.sort_by_key(|(_, item)| item.done);
+                let root = self.vault.as_ref().map(|v| v.root().to_path_buf()).unwrap_or_default();
+                let description = card.body.trim();
+                let description = (!description.is_empty()).then(|| {
+                    div()
+                        .pb_1p5()
+                        .text_sm()
+                        .text_color(theme.foreground.opacity(0.8))
+                        .child(
+                            TextView::markdown(SharedString::from(format!("md-{}", card.id)), description.to_string())
+                                .style(card_markdown_style())
+                                .selectable(false)
+                                .max_lines(4)
+                                .on_link_click(move |url, _, window, cx| open_link(&root, url, window, cx)),
+                        )
+                });
                 Some(
                     v_flex()
                         .gap_1()
+                        .children(description)
                         .children(
                             items
                                 .into_iter()
@@ -3307,8 +3350,17 @@ impl ZettelApp {
                     .flex_1()
                     .min_h_0()
                     .gap_2()
+                    .child(div().text_xs().text_color(theme.muted_foreground).child("DESCRIPTION"))
+                    .child(
+                        v_flex()
+                            .flex_none()
+                            .h(px(TODO_DESCRIPTION_HEIGHT))
+                            .capture_action(cx.listener(Self::on_body_enter))
+                            .child(Editor::new(&self.body).h(relative(1.))),
+                    )
                     .child(
                         h_flex()
+                            .pt_2()
                             .justify_between()
                             .text_xs()
                             .text_color(theme.muted_foreground)
@@ -3366,6 +3418,7 @@ impl ZettelApp {
             CardKind::Note | CardKind::Snippet => v_flex()
                 .flex_1()
                 .min_h_0()
+                .capture_action(cx.listener(Self::on_body_enter))
                 .child(Editor::new(&self.body).h(relative(1.)))
                 .into_any_element(),
         };

@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use chrono::{DateTime, Datelike as _, Local, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -200,31 +202,53 @@ impl Card {
             return;
         }
         if kind == CardKind::Todo && self.items.is_empty() {
-            self.items = self
-                .body
-                .lines()
-                .map(|l| l.trim())
-                .filter(|l| !l.is_empty())
-                .map(|l| {
-                    let (done, text) = strip_checkbox(l);
-                    TodoItem {
-                        text: text.to_string(),
-                        done,
+            if self.body.lines().any(|l| parse_task(l).is_some()) {
+                // Task lines become tasks, the rest stays as the description.
+                let mut rest = Vec::new();
+                for line in self.body.lines() {
+                    match parse_task(line) {
+                        Some(item) => self.items.push(item),
+                        None => rest.push(line),
                     }
-                })
-                .collect();
-            self.body.clear();
-        } else if self.kind == CardKind::Todo && self.body.trim().is_empty() {
-            self.body = self
-                .items
-                .iter()
-                .map(|i| format!("- [{}] {}", if i.done { "x" } else { " " }, i.text))
-                .collect::<Vec<_>>()
-                .join("\n");
+                }
+                self.body = rest.join("\n").trim().to_string();
+            } else {
+                self.items = self
+                    .body
+                    .lines()
+                    .map(|l| l.trim())
+                    .filter(|l| !l.is_empty())
+                    .map(|l| {
+                        let (done, text) = strip_checkbox(l);
+                        TodoItem {
+                            text: text.to_string(),
+                            done,
+                        }
+                    })
+                    .collect();
+                self.body.clear();
+            }
+        } else if self.kind == CardKind::Todo {
+            self.body = self.todo_markdown();
             self.items.clear();
         }
         self.kind = kind;
         self.touch();
+    }
+
+    /// A todo card as markdown: the description, then the task list.
+    pub fn todo_markdown(&self) -> String {
+        let tasks = self
+            .items
+            .iter()
+            .map(|i| format!("- [{}] {}", if i.done { "x" } else { " " }, i.text))
+            .collect::<Vec<_>>()
+            .join("\n");
+        match self.body.trim() {
+            "" => tasks,
+            description if tasks.is_empty() => description.to_string(),
+            description => format!("{description}\n\n{tasks}"),
+        }
     }
 
     pub fn has_tag(&self, tag: &str) -> bool {
@@ -339,6 +363,83 @@ fn strip_checkbox(line: &str) -> (bool, &str) {
         }
     }
     (false, line)
+}
+
+/// Parse a `- [ ] text` or `* [x] text` task line.
+pub fn parse_task(line: &str) -> Option<TodoItem> {
+    let line = line.trim_start();
+    let line = line.strip_prefix("- ").or_else(|| line.strip_prefix("* "))?;
+    for (prefix, done) in [("[ ] ", false), ("[x] ", true), ("[X] ", true)] {
+        if let Some(text) = line.strip_prefix(prefix) {
+            return Some(TodoItem {
+                text: text.to_string(),
+                done,
+            });
+        }
+    }
+    None
+}
+
+/// An edit that replaces `range` (byte offsets) with `text`.
+#[derive(Debug, PartialEq)]
+pub struct TextEdit {
+    pub range: Range<usize>,
+    pub text: String,
+}
+
+/// What Enter at `cursor` does in a markdown list: in an item it starts the
+/// next one (`- `, `2. `, `- [ ] `), on an empty item it removes the marker to
+/// end the list. `None` means an ordinary newline.
+pub fn list_enter(text: &str, cursor: usize) -> Option<TextEdit> {
+    let start = text[..cursor].rfind('\n').map_or(0, |i| i + 1);
+    let end = text[cursor..].find('\n').map_or(text.len(), |i| cursor + i);
+    // Lists inside code blocks are code.
+    let fences = text[..start].lines().filter(|l| l.trim_start().starts_with("```")).count();
+    if fences % 2 == 1 {
+        return None;
+    }
+    let line = &text[start..end];
+    let (marker_len, next) = list_marker(line)?;
+    if cursor < start + marker_len {
+        return None;
+    }
+    if line[marker_len..].trim().is_empty() {
+        // A blank line after the list, or the next line would join the last item.
+        let after_text = text[..start].lines().next_back().is_some_and(|l| !l.trim().is_empty());
+        let text = if after_text { "\n" } else { "" };
+        return Some(TextEdit { range: start..end, text: text.into() });
+    }
+    Some(TextEdit { range: cursor..cursor, text: format!("\n{next}") })
+}
+
+/// The length of the list marker a line starts with, and the marker for the next item.
+fn list_marker(line: &str) -> Option<(usize, String)> {
+    let rest = line.trim_start_matches([' ', '\t']);
+    let indent = &line[..line.len() - rest.len()];
+    let digits = rest.chars().take_while(char::is_ascii_digit).count();
+    let (len, mut next) = if let Some(bullet) = rest.chars().next().filter(|c| "-*+".contains(*c))
+        && rest[1..].starts_with(' ')
+    {
+        (2, format!("{indent}{bullet} "))
+    } else if (1..10).contains(&digits)
+        && let Some(delim) = rest[digits..].chars().next().filter(|c| ".)".contains(*c))
+        && rest[digits + 1..].starts_with(' ')
+    {
+        let n: u64 = rest[..digits].parse().ok()?;
+        (digits + 2, format!("{indent}{}{delim} ", n + 1))
+    } else {
+        return None;
+    };
+    // A task item continues with an open task.
+    let after = &rest[len..];
+    let mut len = indent.len() + len;
+    if let Some(checkbox) = ["[ ]", "[x]", "[X]"].into_iter().find(|b| after.starts_with(b))
+        && matches!(after[checkbox.len()..].chars().next(), None | Some(' '))
+    {
+        len += (checkbox.len() + 1).min(after.len());
+        next.push_str("[ ] ");
+    }
+    Some((len, next))
 }
 
 /// Normalize user tag input: strip `#`, trim, lowercase, spaces become dashes.
@@ -683,13 +784,53 @@ mod tests {
     #[test]
     fn convert_round_trip() {
         let mut card = Card::new(CardKind::Note);
-        card.body = "- [x] milk\n- [ ] eggs\n\nbread".into();
+        card.body = "Shopping\n\n- [x] milk\n- [ ] eggs".into();
         card.convert(CardKind::Todo);
-        assert_eq!(card.items.len(), 3);
+        assert_eq!(card.items.len(), 2);
         assert!(card.items[0].done);
-        assert_eq!(card.items[2].text, "bread");
+        assert_eq!(card.body, "Shopping");
         card.convert(CardKind::Note);
-        assert_eq!(card.body, "- [x] milk\n- [ ] eggs\n- [ ] bread");
+        assert_eq!(card.body, "Shopping\n\n- [x] milk\n- [ ] eggs");
+        assert!(card.items.is_empty());
+
+        // Without task lines every line becomes a task.
+        let mut card = Card::new(CardKind::Note);
+        card.body = "- milk\n\nbread".into();
+        card.convert(CardKind::Todo);
+        let texts: Vec<&str> = card.items.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(texts, ["milk", "bread"]);
+        assert!(card.body.is_empty());
+    }
+
+    fn enter(text: &str) -> String {
+        let cursor = text.find('|').unwrap();
+        let mut text = text.replace('|', "");
+        if let Some(edit) = list_enter(&text, cursor) {
+            text.replace_range(edit.range, &edit.text);
+        }
+        text
+    }
+
+    #[test]
+    fn lists_continue_on_enter() {
+        assert_eq!(enter("- milk|"), "- milk\n- ");
+        assert_eq!(enter("a\n  * milk|\nb"), "a\n  * milk\n  * \nb");
+        assert_eq!(enter("9. nine|"), "9. nine\n10. ");
+        assert_eq!(enter("1) one|"), "1) one\n2) ");
+        assert_eq!(enter("- [x] done|"), "- [x] done\n- [ ] ");
+        assert_eq!(enter("- mi|lk"), "- mi\n- lk");
+        // An empty item ends the list.
+        assert_eq!(enter("- milk\n- |"), "- milk\n\n");
+        assert_eq!(enter("- milk\n- [ ] |\nmore"), "- milk\n\n\nmore");
+        assert_eq!(enter("- milk\n- [ ]|"), "- milk\n\n");
+        assert_eq!(enter("- |"), "");
+        assert_eq!(enter("text\n\n- |"), "text\n\n");
+        // Not in a list, or before the marker.
+        assert_eq!(enter("text|"), "text");
+        assert_eq!(enter("-no space|"), "-no space");
+        assert_eq!(enter("|- milk"), "- milk");
+        assert_eq!(enter("```\n- code|"), "```\n- code");
+        assert_eq!(enter("```\n```\n- milk|"), "```\n```\n- milk\n- ");
     }
 
     #[test]
